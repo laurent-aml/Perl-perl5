@@ -17947,6 +17947,12 @@ elif $test "X$d_readlink" = Xdefine; then
 		    val="$define"
 		    : This will break out of the loop
 		    set X; shift
+		elif $contains /busybox reflect >/dev/null 2>&1; then
+		    echo "You have $type-like $try (busybox)."
+		    procselfexe='"'$try'"'
+		    val="$define"
+		    : This will break out of the loop
+		    set X; shift
 		fi
 	    fi
 	done
