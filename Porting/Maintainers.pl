@@ -504,6 +504,12 @@ our %Modules = (
             'README.packaging',
             'lib/ExtUtils/MakeMaker/version/vpp.pm',
         ],
+        'CUSTOMIZED'   => [
+            qw( lib/ExtUtils/MakeMaker.pm
+                lib/ExtUtils/MM_Unix.pm
+                t/prompt.t
+              )
+        ],
     },
 
     'ExtUtils::PL2Bat' => {

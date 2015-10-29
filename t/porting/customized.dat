@@ -4,6 +4,9 @@
 AutoLoader cpan/AutoLoader/t/02AutoSplit.t bb90cda13b88599ad45de4b45799d5218afcb6d8
 ExtUtils::Constant cpan/ExtUtils-Constant/lib/ExtUtils/Constant/Base.pm 7560e1018f806db5689dee78728ccb8374aea741
 ExtUtils::Constant cpan/ExtUtils-Constant/t/Constant.t 165e9c7132b003fd192d32a737b0f51f9ba4999e
+ExtUtils::MakeMaker cpan/ExtUtils-MakeMaker/lib/ExtUtils/MakeMaker.pm 7f8b9e01d35692c11c27f960d3db496ce2335564
+ExtUtils::MakeMaker cpan/ExtUtils-MakeMaker/lib/ExtUtils/MM_Unix.pm cab65c8a2331cd1de0aa631514063e5149a37b51
+ExtUtils::MakeMaker cpan/ExtUtils-MakeMaker/t/prompt.t c69f5e40918967db4f24c8f9aec63a7499437f53
 Filter::Util::Call pod/perlfilter.pod d1e217d0bc6083755b9017050b8724472c58275a
 Locale::Maketext::Simple cpan/Locale-Maketext-Simple/lib/Locale/Maketext/Simple.pm 57ed38905791a17c150210cd6f42ead22a7707b6
 MIME::Base64 cpan/MIME-Base64/Base64.xs ad617fe2d01932c35b92defa26d40aba601a95a8

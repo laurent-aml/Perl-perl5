@@ -43,4 +43,4 @@ $stdin->write("From STDIN");
 ok( !-t STDIN,      'STDIN not a tty' );
 
 is( prompt("Foo?", 'Bar!'), 'From STDIN',     'from STDIN' );
-like( $stdout->read,  qr/^Foo\? \[Bar!\]\s*$/,      '  question' );
+like( $stdout->read,  qr/^Foo\? \[Bar!\]\s*/,      '  question' );

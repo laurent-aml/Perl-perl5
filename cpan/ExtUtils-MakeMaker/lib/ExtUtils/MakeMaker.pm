@@ -25,7 +25,7 @@ our %Recognized_Att_Keys;
 our %macro_fsentity; # whether a macro is a filesystem name
 our %macro_dep; # whether a macro is a dependency
 
-our $VERSION = '7.76';
+our $VERSION = '7.76_01';
 $VERSION =~ tr/_//d;
 
 # Emulate something resembling CVS $Revision$
@@ -219,6 +219,7 @@ sub prompt ($;$) {  ## no critic
         $ans = <STDIN>;
         if( defined $ans ) {
             $ans =~ s{\015?\012$}{};
+            print "$ans\n" unless $isa_tty;
         }
         else { # user hit ctrl-D
             print "\n";
