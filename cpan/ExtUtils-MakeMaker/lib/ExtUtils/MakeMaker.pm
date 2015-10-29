@@ -219,6 +219,7 @@ sub prompt ($;$) {  ## no critic
         $ans = <STDIN>;
         if( defined $ans ) {
             $ans =~ s{\015?\012$}{};
+            print "$ans\n" unless $isa_tty;
         }
         else { # user hit ctrl-D
             print "\n";
