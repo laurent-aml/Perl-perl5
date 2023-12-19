@@ -4012,11 +4012,14 @@ C<op_targ> field as a side-effect. For example
 PERL_STATIC_INLINE OP *
 Perl_newPADxVOP(pTHX_ I32 type, I32 flags, PADOFFSET padix)
 {
+    OP *o;
+
     PERL_ARGS_ASSERT_NEWPADXVOP;
 
     assert(type == OP_PADSV || type == OP_PADAV || type == OP_PADHV
             || type == OP_PADCV);
-    OP *o = newOP(type, flags);
+
+    o = newOP(type, flags);
     o->op_targ = padix;
     return o;
 }
