@@ -1101,6 +1101,42 @@ Perl_eval_sv(pTHX_ SV *sv, I32 flags);
 #define PERL_ARGS_ASSERT_EVAL_SV                \
         assert(sv)
 
+PERL_CALLCONV PADLIST *
+Perl_execstate_derive_padlist(pTHX_ CV *cv);
+#define PERL_ARGS_ASSERT_EXECSTATE_DERIVE_PADLIST \
+        assert(cv); assert(SvTYPE(cv) == SVt_PVCV || SvTYPE(cv) == SVt_PVFM)
+
+PERL_CALLCONV void
+Perl_execstate_destroy(pTHX);
+#define PERL_ARGS_ASSERT_EXECSTATE_DESTROY
+
+PERL_CALLCONV void
+Perl_execstate_free_padlist(pTHX_ PADLIST *padlist);
+#define PERL_ARGS_ASSERT_EXECSTATE_FREE_PADLIST \
+        assert(padlist)
+
+PERL_CALLCONV void
+Perl_execstate_init(pTHX_ int cxextra);
+#define PERL_ARGS_ASSERT_EXECSTATE_INIT
+
+PERL_CALLCONV void
+Perl_execstate_load(pTHX_ PerlExecState *from);
+#define PERL_ARGS_ASSERT_EXECSTATE_LOAD         \
+        assert(from)
+
+PERL_CALLCONV void
+Perl_execstate_save(pTHX_ PerlExecState *into);
+#define PERL_ARGS_ASSERT_EXECSTATE_SAVE         \
+        assert(into)
+
+PERL_CALLCONV JMPENV *
+Perl_execstate_topenv_root(pTHX);
+#define PERL_ARGS_ASSERT_EXECSTATE_TOPENV_ROOT
+
+PERL_CALLCONV void
+Perl_execstate_unwind(pTHX);
+#define PERL_ARGS_ASSERT_EXECSTATE_UNWIND
+
 /* PERL_CALLCONV bool
 Perl_extended_utf8_to_uv(const U8 * const s, const U8 * const e, UV *cp_p, Size_t *advance_p); */
 

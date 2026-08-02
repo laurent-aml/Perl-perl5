@@ -997,6 +997,7 @@ CORE_NOCFG_H	=		\
 		..\cv.h		\
 		..\dosish.h	\
 		..\embed.h	\
+		..\execstate.h	\
 		..\form.h	\
 		..\gv.h		\
 		..\handy.h	\
