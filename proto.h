@@ -6303,6 +6303,31 @@ Perl_savesharedpvn(pTHX_ const char * const pv, const STRLEN len)
 #define PERL_ARGS_ASSERT_SAVESHAREDPVN          \
         Perl_assert_aTHX; assert(pv)
 
+PERL_CALLCONV PerlSavestackFrozen *
+Perl_savestack_freeze(pTHX_ I32 base_ix)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_SAVESTACK_FREEZE       \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_savestack_frozen_foreach_sv(pTHX_ PerlSavestackFrozen *frozen, PerlSavestackFrozenSVCb cb, void *ud)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_2);
+#define PERL_ARGS_ASSERT_SAVESTACK_FROZEN_FOREACH_SV \
+        Perl_assert_aTHX; assert(cb)
+
+PERL_CALLCONV void
+Perl_savestack_frozen_free(pTHX_ PerlSavestackFrozen *frozen)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_SAVESTACK_FROZEN_FREE  \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_savestack_frozen_run_deferred(pTHX_ PerlSavestackFrozen *frozen)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_SAVESTACK_FROZEN_RUN_DEFERRED \
+        Perl_assert_aTHX
+
 PERL_CALLCONV void
 Perl_savestack_grow(pTHX)
         Perl_attribute_nonnull_aTHX;
@@ -6313,6 +6338,12 @@ PERL_CALLCONV void
 Perl_savestack_grow_cnt(pTHX_ I32 need)
         Perl_attribute_nonnull_aTHX;
 #define PERL_ARGS_ASSERT_SAVESTACK_GROW_CNT     \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_savestack_thaw(pTHX_ PerlSavestackFrozen *frozen)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_SAVESTACK_THAW         \
         Perl_assert_aTHX
 
 PERL_CALLCONV void
