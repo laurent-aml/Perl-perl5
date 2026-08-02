@@ -150,6 +150,13 @@ which should be ignored by F<updateAUTHORS.pl>.
 This file contains a list of files that F<makerel> will ensure get an
 executable bit.
 
+=head2 F<execstate_api.md>
+
+Specification of a core API that creates, swaps and tears down a green-thread
+execution state - the per-thread interpreter state a stackful coroutine module
+has to switch - so that such a module need not reach into interpreter internals
+to do it.
+
 =head2 F<exercise_makedef.pl>
 
 Brute force testing for F<makedef.pl>.

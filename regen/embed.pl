@@ -683,6 +683,9 @@ my @unresolved_visibility_overrides = qw(
     EXEC_ARGV_CAST
     EXEC_PAT_MOD
     EXEC_PAT_MODS
+    execstate_restartop
+    execstate_topenv
+    execstate_topenv_reset
     EXPECT
     EXPERIMENTAL_INPLACESCAN
     EXTEND_HWM_SET

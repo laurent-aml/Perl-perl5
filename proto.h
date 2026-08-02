@@ -1507,6 +1507,59 @@ Perl_eval_sv(pTHX_ SV *sv, I32 flags)
 #define PERL_ARGS_ASSERT_EVAL_SV                \
         Perl_assert_aTHX; assert(sv)
 
+PERL_CALLCONV PADLIST *
+Perl_execstate_derive_padlist(pTHX_ CV *cv)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1);
+#define PERL_ARGS_ASSERT_EXECSTATE_DERIVE_PADLIST \
+        Perl_assert_aTHX; assert(cv); \
+        assert(SvTYPE(cv) == SVt_PVCV || SvTYPE(cv) == SVt_PVFM)
+
+PERL_CALLCONV void
+Perl_execstate_destroy(pTHX)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_EXECSTATE_DESTROY      \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_execstate_free_padlist(pTHX_ PADLIST *padlist)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1);
+#define PERL_ARGS_ASSERT_EXECSTATE_FREE_PADLIST \
+        Perl_assert_aTHX; assert(padlist)
+
+PERL_CALLCONV void
+Perl_execstate_init(pTHX_ int cxextra)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_EXECSTATE_INIT         \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_execstate_load(pTHX_ PerlExecState *from)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1);
+#define PERL_ARGS_ASSERT_EXECSTATE_LOAD         \
+        Perl_assert_aTHX; assert(from)
+
+PERL_CALLCONV void
+Perl_execstate_save(pTHX_ PerlExecState *into)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1);
+#define PERL_ARGS_ASSERT_EXECSTATE_SAVE         \
+        Perl_assert_aTHX; assert(into)
+
+PERL_CALLCONV JMPENV *
+Perl_execstate_topenv_root(pTHX)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_EXECSTATE_TOPENV_ROOT  \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_execstate_unwind(pTHX)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_EXECSTATE_UNWIND       \
+        Perl_assert_aTHX
+
 PERL_CALLCONV Size_t
 Perl_expected_size(UV size);
 #define PERL_ARGS_ASSERT_EXPECTED_SIZE
