@@ -2406,6 +2406,1437 @@ Perl_multicore_register_offload(pTHX_ perl_multicore_offload_t offload)
     PL_multicore_offload = offload;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Savestack suspend/resume API ("parkapi") - Phase 3: freeze/thaw/free/foreach_sv.
+ *
+ * A supported way to freeze (serialize + unwind) a region of the save stack
+ * and later thaw (re-apply) it, so that suspend-a-scope consumers such as
+ * Future::AsyncAwait and Coro need not re-implement leave_scope in reverse.
+ * See Porting/savestack_suspend_api.md for the full design and plan.
+ *
+ * Each per-SAVEt handler is derived directly from the matching case in
+ * Perl_leave_scope() above, so its refcount ownership is correct by
+ * construction relative to core (the whole point of moving this into core).
+ * A save type with no handler is refused (croak) - safe by default.
+ *
+ * Landed so far, each with freeze + thaw + discard + walk:
+ *     SAVEt_SV     ("local $pkg_scalar";  Perl_save_scalar)   \ share
+ *     SAVEt_SVREF  ("local $$ref" et al.; Perl_save_svref)    / restore_sv
+ *     SAVEt_AV     ("local @pkg_array";   Perl_save_ary)      \ share
+ *     SAVEt_HV     ("local %pkg_hash";    Perl_save_hash)     / avhv_common
+ *     SAVEt_HELEM  ("local $h{k}";        Perl_save_helem_flags) \ share, re-
+ *     SAVEt_AELEM  ("local $a[i]";        Perl_save_aelem_flags) / fetch slot
+ *     SAVEt_DELETE ("local $h{new_key}";  Perl_save_hdelete)     \ delete now,
+ *     SAVEt_ADELETE("local $a[new_idx]";  Perl_save_adelete)     / re-create
+ *     SAVEt_GVSV          (GV scalar slot; pp_refgen etc.)       \ share
+ *     SAVEt_GENERIC_SVREF (SAVEGENERICSV: PL_curstash, ...)      / restore_svp
+ *     SAVEt_INT/IV/I32/I16/I8/BOOL/STRLEN (+ tight _SMALL forms) - localized C
+ *                         scalars (S_*_cint); no SVs, no refcounts
+ *     SAVEt_SPTR/VPTR/PPTR/HPTR/APTR - non-refcounted pointer slots (S_*_ptr)
+ *     SAVEt_ITEM          (save_item; sv_replace-based localization)
+ *   memory-reclaiming discards (run by frozen_free): SAVEt_FREESV/FREEPV/FREEOP/
+ *     FREEPADNAME/FREECOPHH/FREERCPV/MORTALIZESV/READONLY_OFF, SAVEt_SET_SVFLAGS
+ *   deferred user callbacks (run by savestack_frozen_run_deferred, NOT by
+ *     frozen_free): SAVEt_DESTRUCTOR / SAVEt_DESTRUCTOR_X
+ *   pad-scope bookkeeping (a suspended async sub's lexicals leave these):
+ *     SAVEt_CLEARSV/CLEARPADRANGE (S_*_padclear), SAVEt_COMPPAD (S_*_comppad),
+ *     SAVEt_PADSV_AND_MORTALIZE (S_*_padsv)
+ * Still non-relocatable (croak): interpreter/compile state (ALLOC, REGCONTEXT,
+ * HINTS, GP, GVSLOT, ...).  Tied/magical (SvSMAGICAL) targets are refused for
+ * now - see S_can_freeze_*().
+ * ------------------------------------------------------------------------- */
+
+/* One serialized save-stack entry.  Per-type handlers interpret arg[] the same
+ * way leave_scope's switch interprets the raw save-stack slots.  Layout of arg[]
+ * is documented next to each handler. */
+typedef struct {
+    U8  type;                   /* SAVEt_* (already masked with SAVE_MASK) */
+    U8  nargs;                  /* == leave_scope_arg_counts[type], 0..3   */
+    ANY arg[3];                 /* the retained / serialized argument slots */
+} SavedEntry;
+
+struct PerlSavestackFrozen {
+    U32         len;            /* number of entries in use                 */
+    U32         max;            /* allocated capacity                       */
+    SavedEntry *entries;        /* captured top-first (unwind order)        */
+};
+
+/* Per-SAVEt handler vtable, keyed by SAVEt_*.  A row with relocatable == FALSE
+ * (and hence NULL handlers) makes freeze() croak on that type.  `can_freeze`
+ * (optional) rejects individual instances a relocatable type cannot yet handle;
+ * `freeze` parks + serializes one entry; `thaw` re-pushes a live entry and
+ * re-applies the localized value; `discard` drops the refs an unthawed entry
+ * still owns; `walk` enumerates the SVs an entry retains (introspection). */
+typedef struct {
+    bool relocatable;
+    bool (*can_freeze)(pTHX_ const ANY *ap, UV uv);
+    void (*freeze)    (pTHX_ const ANY *ap, UV uv, SavedEntry *out);
+    void (*thaw)      (pTHX_ const SavedEntry *in);
+    void (*discard)   (pTHX_ SavedEntry *entry);
+    void (*walk)      (pTHX_ const SavedEntry *in,
+                       PerlSavestackFrozenSVCb cb, void *ud);
+} savetype_reloc;
+
+/* --- SAVEt_SV / SAVEt_SVREF (scalar localization) ------------------------- *
+ *
+ * Save-stack slots captured (ap points at the first arg, as in leave_scope):
+ *   ap[0] = target locator: SAVEt_SV -> GV* (holds a ref); SAVEt_SVREF -> SV**
+ *   ap[1] = outer value (holds the ref save_scalar/save_svref took on it)
+ * The slot itself (&GvSV(gv) or *sptr) currently holds the localized value,
+ * which owns the slot's reference.
+ *
+ * Frozen entry layout:
+ *   arg[0] = ap[0]        (GV* with ref retained | SV** locator, no ref)
+ *   arg[1] = localized SV (ref retained, transferred out of the slot)
+ */
+
+/* Re-sync a magical target after its value slot has been changed, mirroring the
+ * PL_localizing=2; mg_set() that leave_scope runs when restoring a localized
+ * value (scope.c restore_sv / avhv_common).  Called on BOTH transitions so a
+ * magical global tracks whatever is currently installed:
+ *   - freeze (park): after reverting the slot to the OUTER value, so e.g. %ENV
+ *     re-syncs the real environment to the outer value while suspended;
+ *   - thaw (restore): after re-installing the LOCALIZED value.
+ * Caveat: mg_set can in principle die (a tied STORE that throws); if that
+ * happens during freeze the partially-built blob leaks and the save stack is
+ * left partly unwound.  This is the same exposure the hand-rolled FAA suspend
+ * has; tied containers are refused up front (S_can_freeze_elem/_delete) so this
+ * is bounded to non-tied magic such as %ENV / %SIG. */
+static void
+S_resync_magic(pTHX_ SV *sv)
+{
+    if (SvSMAGICAL(sv)) {
+        PL_localizing = 2;
+        mg_set(sv);
+        PL_localizing = 0;
+    }
+}
+
+static bool
+S_can_freeze_sv(pTHX_ const ANY *ap, UV uv)
+{
+    PERL_UNUSED_ARG(uv);
+    PERL_UNUSED_ARG(ap);
+    /* A magical outer value is fine: freeze/thaw replay its set-magic via
+     * S_resync_magic (mirroring leave_scope's restore_sv). */
+    return TRUE;
+}
+
+static void
+S_freeze_sv(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    SV **svp      = (type == SAVEt_SV) ? &GvSV(ap[0].any_gv) : ap[0].any_svp;
+    SV *localized = *svp;           /* current value: owns the slot's ref  */
+    SV *outer     = ap[1].any_sv;   /* pre-local value: owns save_*'s inc   */
+
+    /* Mirror leave_scope's non-magical restore_sv: put the outer value back in
+     * the slot and drop the extra ref save_scalar/save_svref took on it, so the
+     * slot again solely owns it.  Unlike leave_scope we do NOT free the
+     * localized value or (for SAVEt_SV) the GV: those refs are transferred into
+     * the frozen entry for thaw()/discard(). */
+    *svp = outer;
+    SvREFCNT_dec_NN(outer);
+    S_resync_magic(aTHX_ outer);      /* magical (e.g. tied) target: re-sync outer */
+
+    out->arg[0]        = ap[0];       /* GV* (ref kept) | SV** locator (no ref) */
+    out->arg[1].any_sv = localized;   /* retained; slot's ref now owned by blob */
+}
+
+static void
+S_thaw_sv(pTHX_ const SavedEntry *in)
+{
+    const U8 type = in->type;
+    SV *localized = in->arg[1].any_sv;
+    SV **svp;
+    void *locator;
+
+    if (type == SAVEt_SV) {
+        GV *gv  = in->arg[0].any_gv;
+        svp     = &GvSV(gv);
+        locator = (void *)gv;      /* transfer the retained GV ref to the entry */
+    }
+    else { /* SAVEt_SVREF */
+        svp     = in->arg[0].any_svp;
+        locator = (void *)svp;     /* raw locator; save_svref held no ref on it */
+    }
+
+    /* Re-push the save entry that freeze() parked away, then re-install the
+     * localized value - mirroring save_scalar/save_svref + save_scalar_at.  The
+     * slot currently holds the outer value: SvREFCNT_inc it for the new entry's
+     * second slot (as save_*() did) before overwriting the slot.  The blob's
+     * refs on the locator (SAVEt_SV) and on the localized value are transferred
+     * onto the live stack / into the slot, so thaw() must not run discard. */
+    save_pushptrptr(locator, SvREFCNT_inc(*svp), (int)type);
+    *svp = localized;
+    S_resync_magic(aTHX_ localized);  /* magical target: re-sync to localized */
+}
+
+static void
+S_discard_sv(pTHX_ SavedEntry *entry)
+{
+    if (entry->type == SAVEt_SV)
+        SvREFCNT_dec(entry->arg[0].any_gv);   /* retained GV ref            */
+    SvREFCNT_dec(entry->arg[1].any_sv);       /* retained localized value   */
+}
+
+static void
+S_walk_sv(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    if (in->type == SAVEt_SV)
+        cb(aTHX_ (SV *)in->arg[0].any_gv, "SAVEt_SV localized GV", ud);
+    cb(aTHX_ in->arg[1].any_sv,
+       in->type == SAVEt_SV ? "SAVEt_SV localized value"
+                            : "SAVEt_SVREF localized value", ud);
+}
+
+/* --- SAVEt_AV / SAVEt_HV (array / hash localization) ---------------------- *
+ *
+ * Save-stack slots captured (ap points at the first arg):
+ *   ap[0] = GV* (holds a ref, from save_ary/save_hash's SvREFCNT_inc)
+ *   ap[1] = outer AV or HV -- NOTE: NOT reference-counted by save_ary/save_hash;
+ *           the slot's own ref was transferred onto the stack.
+ * GvAV(gv) / GvHV(gv) currently holds the localized (new) container.
+ *
+ * This is the inverse refcount convention to the scalar family: leave_scope's
+ * avhv_common frees the localized container and the GV but does NOT touch the
+ * outer container (it just re-adopts the transferred ref).  So freeze does no
+ * SvREFCNT_dec at all - it reverts the slot to the outer container and retains
+ * the GV and the localized container in the frozen entry.
+ *
+ * Frozen entry layout:
+ *   arg[0] = GV* (ref retained)
+ *   arg[1] = localized AV or HV (ref retained, transferred out of the slot)
+ */
+
+static bool
+S_can_freeze_avhv(pTHX_ const ANY *ap, UV uv)
+{
+    PERL_UNUSED_ARG(uv);
+    PERL_UNUSED_ARG(ap);
+    /* A magical outer container (e.g. local %ENV / %SIG) is fine: freeze/thaw
+     * replay avhv_common's set-magic via S_resync_magic. */
+    return TRUE;
+}
+
+static void
+S_freeze_avhv(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    GV *gv        = ap[0].any_gv;
+    SV *localized;
+
+    if (type == SAVEt_AV) {
+        localized = (SV *)GvAV(gv);
+        GvAV(gv)  = ap[1].any_av;   /* revert to outer; no inc (as leave_scope) */
+    }
+    else { /* SAVEt_HV */
+        localized = (SV *)GvHV(gv);
+        GvHV(gv)  = ap[1].any_hv;
+    }
+    S_resync_magic(aTHX_ ap[1].any_sv);  /* magical (%ENV/%SIG): re-sync to outer */
+
+    out->arg[0].any_gv = gv;         /* retained (leave_scope would dec)        */
+    out->arg[1].any_sv = localized;  /* retained (leave_scope would dec)        */
+}
+
+static void
+S_thaw_avhv(pTHX_ const SavedEntry *in)
+{
+    const U8 type = in->type;
+    GV *gv        = in->arg[0].any_gv;
+    SV *localized = in->arg[1].any_sv;
+
+    /* Re-push the parked entry, transferring the blob's GV ref back onto it (as
+     * save_ary/save_hash held one) and the current outer container without a
+     * fresh inc (as they did), then re-install the localized container. */
+    if (type == SAVEt_AV) {
+        save_pushptrptr(gv, GvAV(gv), SAVEt_AV);
+        GvAV(gv) = (AV *)localized;
+    }
+    else { /* SAVEt_HV */
+        save_pushptrptr(gv, GvHV(gv), SAVEt_HV);
+        GvHV(gv) = (HV *)localized;
+    }
+    S_resync_magic(aTHX_ localized);  /* magical (%ENV/%SIG): re-sync to localized */
+}
+
+static void
+S_discard_avhv(pTHX_ SavedEntry *entry)
+{
+    SvREFCNT_dec(entry->arg[0].any_gv);   /* retained GV ref                  */
+    SvREFCNT_dec(entry->arg[1].any_sv);   /* retained localized AV/HV         */
+}
+
+static void
+S_walk_avhv(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    cb(aTHX_ (SV *)in->arg[0].any_gv,
+       in->type == SAVEt_AV ? "SAVEt_AV localized GV"
+                            : "SAVEt_HV localized GV", ud);
+    cb(aTHX_ in->arg[1].any_sv,
+       in->type == SAVEt_AV ? "SAVEt_AV localized value"
+                            : "SAVEt_HV localized value", ud);
+}
+
+/* --- SAVEt_HELEM / SAVEt_AELEM (hash / array element localization) -------- *
+ *
+ * Save-stack slots captured (ap points at the first arg):
+ *   ap[0] = container: HV (HELEM) or AV (AELEM), holds a ref
+ *   ap[1] = key: HELEM -> SV* copy (owned); AELEM -> IV index (no ref)
+ *   ap[2] = outer value (holds a ref, from save_helem/save_aelem's inc)
+ * The element slot currently holds the localized value.
+ *
+ * An element's address is NOT stable across a suspension (the hash may rehash,
+ * the array may be reallocated), so - exactly like leave_scope - both freeze
+ * and thaw locate the element afresh from (container, key/idx).  Tied/magical
+ * containers, non-real arrays and vanished elements are refused for now
+ * (S_can_freeze_elem).  Otherwise this mirrors the scalar family's restore_sv.
+ *
+ * Frozen entry layout:
+ *   arg[0] = container (ref retained)
+ *   arg[1] = key SV (HELEM, ref retained) | IV index (AELEM)
+ *   arg[2] = localized value (ref retained)
+ */
+
+static SV **
+S_elem_slot(pTHX_ U8 type, SV *container, const ANY *key, I32 lval)
+{
+    if (type == SAVEt_HELEM) {
+        HE *he = hv_fetch_ent((HV *)container, key->any_sv, lval, 0);
+        return he ? &HeVAL(he) : NULL;
+    }
+    return av_fetch((AV *)container, key->any_iv, lval);
+}
+
+static bool
+S_can_freeze_elem(pTHX_ const ANY *ap, UV uv)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    SV *container = ap[0].any_sv;
+    SV **svp;
+
+    /* Tied elements route through mg_copy/FETCH/STORE rather than the HE/AV slot
+     * we manipulate directly; refuse them (as the hand-rolled FAA suspend does).
+     * Other container magic - %ENV / %SIG (envelem/sigelem on the values) - is
+     * fine: its set-magic is replayed by S_resync_magic on freeze and thaw. */
+    if (mg_find(container, PERL_MAGIC_tied))
+        return FALSE;
+    if (type == SAVEt_AELEM && !AvREAL((AV *)container))    /* reify-guard path */
+        return FALSE;
+
+    svp = S_elem_slot(aTHX_ type, container, &ap[1], 0);    /* non-creating */
+    return svp && *svp && *svp != &PL_sv_undef;
+}
+
+static void
+S_freeze_elem(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    SV *container = ap[0].any_sv;
+    SV *outer     = ap[2].any_sv;
+    SV **svp      = S_elem_slot(aTHX_ type, container, &ap[1], 1);
+    SV *localized;
+
+    assert(svp);                     /* pass 1 (can_freeze) verified existence */
+    localized = *svp;
+
+    *svp = outer;                    /* revert element to outer value */
+    SvREFCNT_dec_NN(outer);          /* drop save_*elem's inc (as leave_scope) */
+    S_resync_magic(aTHX_ outer);     /* magical element (%ENV/%SIG): re-sync outer */
+
+    out->arg[0] = ap[0];             /* container (ref retained)               */
+    out->arg[1] = ap[1];             /* key SV retained (HELEM) | idx (AELEM)  */
+    out->arg[2].any_sv = localized;  /* retained                               */
+}
+
+static void
+S_thaw_elem(pTHX_ const SavedEntry *in)
+{
+    const U8 type = in->type;
+    SV *container = in->arg[0].any_sv;
+    SV *localized = in->arg[2].any_sv;
+    SV **svp      = S_elem_slot(aTHX_ type, container, &in->arg[1], 1);
+    dSS_ADD;
+
+    assert(svp);
+
+    /* Re-push the parked entry mirroring save_helem_flags/save_aelem_flags,
+     * transferring the blob's container ref (and, for HELEM, the key copy) back
+     * onto it and taking a fresh ref on the current outer value, then re-install
+     * the localized value. */
+    SS_ADD_PTR(container);
+    if (type == SAVEt_HELEM)
+        SS_ADD_PTR(in->arg[1].any_sv);
+    else
+        SS_ADD_IV(in->arg[1].any_iv);
+    SS_ADD_PTR(SvREFCNT_inc(*svp));
+    SS_ADD_UV(type);
+    SS_ADD_END(4);
+
+    *svp = localized;
+    S_resync_magic(aTHX_ localized); /* magical element (%ENV/%SIG): re-sync */
+}
+
+static void
+S_discard_elem(pTHX_ SavedEntry *entry)
+{
+    SvREFCNT_dec(entry->arg[0].any_sv);        /* container                   */
+    if (entry->type == SAVEt_HELEM)
+        SvREFCNT_dec(entry->arg[1].any_sv);    /* key copy                    */
+    SvREFCNT_dec(entry->arg[2].any_sv);        /* localized value             */
+}
+
+static void
+S_walk_elem(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    const bool helem = (in->type == SAVEt_HELEM);
+    cb(aTHX_ in->arg[0].any_sv,
+       helem ? "SAVEt_HELEM container" : "SAVEt_AELEM container", ud);
+    if (helem)
+        cb(aTHX_ in->arg[1].any_sv, "SAVEt_HELEM key", ud);
+    cb(aTHX_ in->arg[2].any_sv,
+       helem ? "SAVEt_HELEM localized value" : "SAVEt_AELEM localized value", ud);
+}
+
+/* --- SAVEt_DELETE / SAVEt_ADELETE (localized new element) ----------------- *
+ *
+ * Pushed (instead of SAVEt_HELEM/SAVEt_AELEM) when the localized key/index did
+ * NOT exist beforehand (pp_helem/pp_aelem: !preeminent).  Restoring the outer
+ * state therefore means DELETING the element again, which is what leave_scope
+ * does (hv_delete / av_delete, G_DISCARD).
+ *
+ * Save-stack slots captured (ap points at the first arg):
+ *   SAVEt_DELETE : ap[0] = key char* (owned), ap[1] = I32 klen, ap[2] = HV* (+1)
+ *   SAVEt_ADELETE: ap[0] = IV index,          ap[1] = AV* (+1)
+ *
+ * Park: perform the deletion now (so the outer world sees the element absent),
+ * but keep the deleted value - and, for HELEM, the key as an SV - so thaw can
+ * re-create the element and re-arm the delete.  The owned char* key is consumed
+ * into an SV to free a slot for the retained value.
+ *
+ * Frozen entry layout:
+ *   SAVEt_DELETE : arg[0] = key SV (owned), arg[1] = HV* (ref), arg[2] = value
+ *   SAVEt_ADELETE: arg[0] = IV index,       arg[1] = AV* (ref), arg[2] = value
+ */
+
+static bool
+S_can_freeze_delete(pTHX_ const ANY *ap, UV uv)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    /* Refuse tied containers (their delete/store route through DELETE/STORE, not
+     * the slot); allow other magic (%ENV/%SIG) - hv_delete/av_delete run the
+     * container's delete-magic on freeze, and thaw replays set-magic. */
+    if (type == SAVEt_DELETE) {
+        HV *hv = ap[2].any_hv;
+        if (mg_find((SV *)hv, PERL_MAGIC_tied))
+            return FALSE;
+        return cBOOL(hv_exists(hv, ap[0].any_pv, ap[1].any_i32));
+    }
+    else { /* SAVEt_ADELETE */
+        AV *av = ap[1].any_av;
+        if (mg_find((SV *)av, PERL_MAGIC_tied))
+            return FALSE;
+        return cBOOL(av_exists(av, ap[0].any_iv));
+    }
+}
+
+static void
+S_freeze_delete(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+
+    if (type == SAVEt_DELETE) {
+        char  *keypv = ap[0].any_pv;
+        I32    klen  = ap[1].any_i32;
+        HV    *hv    = ap[2].any_hv;
+        STRLEN len   = (klen < 0) ? (STRLEN)(-klen) : (STRLEN)klen;
+        SV    *value = hv_delete(hv, keypv, klen, 0);   /* remove; mortal value */
+        SV    *keysv;
+
+        assert(value);
+        SvREFCNT_inc_simple_void_NN(value);             /* retain past FREETMPS */
+        keysv = newSVpvn(keypv, len);
+        if (klen < 0)
+            SvUTF8_on(keysv);
+        Safefree(keypv);                                /* consume owned key pv */
+
+        out->arg[0].any_sv = keysv;    /* owned key SV                          */
+        out->arg[1].any_hv = hv;       /* retained (leave_scope would FREESV)   */
+        out->arg[2].any_sv = value;    /* retained deleted value                */
+    }
+    else { /* SAVEt_ADELETE */
+        SSize_t idx  = ap[0].any_iv;
+        AV     *av   = ap[1].any_av;
+        SV     *value = av_delete(av, idx, 0);
+
+        assert(value);
+        SvREFCNT_inc_simple_void_NN(value);
+
+        out->arg[0].any_iv = idx;
+        out->arg[1].any_av = av;
+        out->arg[2].any_sv = value;
+    }
+}
+
+static void
+S_thaw_delete(pTHX_ const SavedEntry *in)
+{
+    const U8 type = in->type;
+    SV *value = in->arg[2].any_sv;
+
+    if (type == SAVEt_DELETE) {
+        SV         *keysv = in->arg[0].any_sv;
+        HV         *hv    = in->arg[1].any_hv;
+        STRLEN      len;
+        const char *kp    = SvPV_const(keysv, len);
+        I32         klen  = SvUTF8(keysv) ? -(I32)len : (I32)len;
+        char       *newpv = savepvn(kp, len);
+        dSS_ADD;
+
+        (void)hv_store_ent(hv, keysv, value, 0);   /* value ref -> hash         */
+        SS_ADD_PTR(newpv);                         /* fresh owned key (as save) */
+        SS_ADD_INT(klen);
+        SS_ADD_PTR(hv);                            /* transfer blob's HV ref    */
+        SS_ADD_UV(SAVEt_DELETE);
+        SS_ADD_END(4);
+        SvREFCNT_dec(keysv);                       /* blob's key SV consumed    */
+        S_resync_magic(aTHX_ value);   /* magical element (%ENV/%SIG): re-sync  */
+    }
+    else { /* SAVEt_ADELETE */
+        SSize_t idx = in->arg[0].any_iv;
+        AV     *av  = in->arg[1].any_av;
+        dSS_ADD;
+
+        (void)av_store(av, idx, value);            /* value ref -> array        */
+        SS_ADD_UV((UV)idx);
+        SS_ADD_PTR(av);                            /* transfer blob's AV ref    */
+        SS_ADD_IV(SAVEt_ADELETE);
+        SS_ADD_END(3);
+        S_resync_magic(aTHX_ value);   /* magical element: re-sync              */
+    }
+}
+
+static void
+S_discard_delete(pTHX_ SavedEntry *entry)
+{
+    if (entry->type == SAVEt_DELETE)
+        SvREFCNT_dec(entry->arg[0].any_sv);   /* retained key SV                */
+    SvREFCNT_dec(entry->arg[1].any_sv);       /* retained container (HV/AV)     */
+    SvREFCNT_dec(entry->arg[2].any_sv);       /* retained deleted value         */
+}
+
+static void
+S_walk_delete(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    const bool hd = (in->type == SAVEt_DELETE);
+    if (hd)
+        cb(aTHX_ in->arg[0].any_sv, "SAVEt_DELETE key", ud);
+    cb(aTHX_ in->arg[1].any_sv,
+       hd ? "SAVEt_DELETE hash" : "SAVEt_ADELETE array", ud);
+    cb(aTHX_ in->arg[2].any_sv,
+       hd ? "SAVEt_DELETE value" : "SAVEt_ADELETE value", ud);
+}
+
+/* --- SAVEt_GVSV / SAVEt_GENERIC_SVREF (restore_svp scalar cousins) -------- *
+ *
+ * Save-stack slots captured (ap points at the first arg):
+ *   SAVEt_GVSV        : ap[0] = GV*  (no ref)  -> slot is &GvSV(gv)
+ *   SAVEt_GENERIC_SVREF: ap[0] = SV** (no ref) -> slot is that SV**
+ *   ap[1] = outer value (holds the ref save took on it)
+ * The slot currently holds the localized value (owns the slot's ref).
+ *
+ * Both use leave_scope's restore_svp, which - unlike restore_sv - holds no ref
+ * on the locator and runs NO set-magic, so these are magic-safe and need no
+ * can_freeze gate.  freeze reverts the slot to the outer value and drops the
+ * saved ref on it (mirroring restore_svp's dec(a1)), retaining only the
+ * localized value.
+ *
+ * Frozen entry layout:  arg[0] = locator (GV* or SV**, no ref)
+ *                       arg[1] = localized value (ref retained)
+ */
+
+static SV **
+S_svp_slot(pTHX_ U8 type, const ANY *locator)
+{
+    return (type == SAVEt_GVSV) ? &GvSV(locator->any_gv) : locator->any_svp;
+}
+
+static void
+S_freeze_svp(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    SV **svp      = S_svp_slot(aTHX_ type, &ap[0]);
+    SV *localized = *svp;
+    SV *outer     = ap[1].any_sv;
+
+    *svp = outer;
+    SvREFCNT_dec_NN(outer);          /* release save's ref (restore_svp dec) */
+
+    out->arg[0]        = ap[0];       /* locator (no ref)                    */
+    out->arg[1].any_sv = localized;   /* retained                            */
+}
+
+static void
+S_thaw_svp(pTHX_ const SavedEntry *in)
+{
+    const U8 type = in->type;
+    SV **svp      = S_svp_slot(aTHX_ type, &in->arg[0]);
+    SV *localized = in->arg[1].any_sv;
+
+    /* Re-push mirroring pp's SAVEt_GVSV / save_generic_svref: locator (no ref)
+     * plus a fresh ref on the current outer value, then re-install localized. */
+    save_pushptrptr(in->arg[0].any_ptr, SvREFCNT_inc(*svp), (int)type);
+    *svp = localized;
+}
+
+static void
+S_discard_svp(pTHX_ SavedEntry *entry)
+{
+    SvREFCNT_dec(entry->arg[1].any_sv);   /* only the localized value is owned */
+}
+
+static void
+S_walk_svp(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    cb(aTHX_ in->arg[1].any_sv,
+       in->type == SAVEt_GVSV ? "SAVEt_GVSV localized value"
+                              : "SAVEt_GENERIC_SVREF localized value", ud);
+}
+
+/* --- localized C scalars: SAVEt_INT{,_SMALL}, IV, I32{,_SMALL}, I16, I8,
+ *     BOOL, STRLEN{,_SMALL} ---------------------------------------------------
+ *
+ * These localize a C variable (int / IV / I32 / ... / STRLEN) rather than an
+ * SV, so there are no references to manage and nothing for walk/discard to do
+ * (their vtable rows leave can_freeze/discard/walk NULL).  The outer value is
+ * held either in a separate slot (the wide INT/IV/I32/STRLEN forms) or packed
+ * into the type word (the tight _SMALL / I16 / I8 / BOOL forms); the pointer to
+ * the C variable is the remaining slot.  freeze reads the current (localized)
+ * value, writes the outer value back, and keeps the localized value as an IV;
+ * thaw re-arms the save with the matching save_*() helper - which re-encodes
+ * the (now outer) value, choosing the tight form when it fits - then writes the
+ * localized value back.
+ *
+ * Frozen entry layout:  arg[0] = pointer to the C variable
+ *                       arg[1] = localized value (as IV)
+ */
+
+static void
+S_freeze_cint(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type = (U8)uv & SAVE_MASK;
+    void *ptr;
+    IV    localized;
+
+    switch (type) {
+    case SAVEt_INT:
+        ptr = ap[1].any_ptr; localized = (IV)*(int*)ptr;
+        *(int*)ptr = (int)ap[0].any_i32;                    break;
+    case SAVEt_INT_SMALL:
+        ptr = ap[0].any_ptr; localized = (IV)*(int*)ptr;
+        *(int*)ptr = (int)(uv >> SAVE_TIGHT_SHIFT);         break;
+    case SAVEt_IV:
+        ptr = ap[1].any_ptr; localized = *(IV*)ptr;
+        *(IV*)ptr = ap[0].any_iv;                           break;
+    case SAVEt_I32:
+        ptr = ap[1].any_ptr; localized = (IV)*(I32*)ptr;
+        *(I32*)ptr = ap[0].any_i32;                         break;
+    case SAVEt_I32_SMALL:
+        ptr = ap[0].any_ptr; localized = (IV)*(I32*)ptr;
+        *(I32*)ptr = (I32)(uv >> SAVE_TIGHT_SHIFT);         break;
+    case SAVEt_I16:
+        ptr = ap[0].any_ptr; localized = (IV)*(I16*)ptr;
+        *(I16*)ptr = (I16)(uv >> 8);                        break;
+    case SAVEt_I8:
+        ptr = ap[0].any_ptr; localized = (IV)*(I8*)ptr;
+        *(I8*)ptr = (I8)(uv >> 8);                          break;
+    case SAVEt_BOOL:
+        ptr = ap[0].any_ptr; localized = (IV)*(bool*)ptr;
+        *(bool*)ptr = cBOOL(uv >> 8);                       break;
+    case SAVEt_STRLEN:
+        ptr = ap[1].any_ptr; localized = (IV)*(STRLEN*)ptr;
+        *(STRLEN*)ptr = (STRLEN)ap[0].any_iv;               break;
+    case SAVEt_STRLEN_SMALL:
+        ptr = ap[0].any_ptr; localized = (IV)*(STRLEN*)ptr;
+        *(STRLEN*)ptr = (STRLEN)(uv >> SAVE_TIGHT_SHIFT);   break;
+    default:
+        NOT_REACHED; /* NOTREACHED */
+    }
+
+    out->arg[0].any_ptr = ptr;
+    out->arg[1].any_iv  = localized;
+}
+
+static void
+S_thaw_cint(pTHX_ const SavedEntry *in)
+{
+    void    *ptr = in->arg[0].any_ptr;
+    const IV loc = in->arg[1].any_iv;
+
+    switch (in->type) {
+    case SAVEt_INT: case SAVEt_INT_SMALL:
+        save_int((int*)ptr);        *(int*)ptr    = (int)loc;       break;
+    case SAVEt_IV:
+        save_iv((IV*)ptr);          *(IV*)ptr     = (IV)loc;        break;
+    case SAVEt_I32: case SAVEt_I32_SMALL:
+        save_I32((I32*)ptr);        *(I32*)ptr    = (I32)loc;       break;
+    case SAVEt_I16:
+        save_I16((I16*)ptr);        *(I16*)ptr    = (I16)loc;       break;
+    case SAVEt_I8:
+        save_I8((I8*)ptr);          *(I8*)ptr     = (I8)loc;        break;
+    case SAVEt_BOOL:
+        save_bool((bool*)ptr);      *(bool*)ptr   = cBOOL(loc);     break;
+    case SAVEt_STRLEN: case SAVEt_STRLEN_SMALL:
+        save_strlen((STRLEN*)ptr);  *(STRLEN*)ptr = (STRLEN)loc;    break;
+    default:
+        NOT_REACHED; /* NOTREACHED */
+    }
+}
+
+/* --- SAVEt_SPTR / VPTR / PPTR / HPTR / APTR (non-refcounted pointer slots) - *
+ *
+ * leave_scope restores *slot = outer with no reference counting - these slots
+ * do not own their pointee (save_sptr and friends push (*slot, slot) with no
+ * inc).  ap[0] = outer value, ap[1] = the slot.  freeze saves the current
+ * pointer, writes the outer value back, and keeps the localized pointer (again
+ * without a ref); thaw re-pushes (current outer, slot) and reinstalls the
+ * localized pointer.  Nothing is owned, so discard/walk stay NULL.
+ *
+ * Frozen entry layout:  arg[0] = slot, arg[1] = localized pointer (no ref)
+ */
+
+static void
+S_freeze_ptr(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    SV **slot     = ap[1].any_svp;
+    SV *localized = *slot;
+
+    PERL_UNUSED_ARG(uv);
+    *slot = ap[0].any_sv;            /* restore outer (no refcounting) */
+
+    out->arg[0].any_svp = slot;
+    out->arg[1].any_sv  = localized; /* raw pointer, not owned         */
+}
+
+static void
+S_thaw_ptr(pTHX_ const SavedEntry *in)
+{
+    SV **slot = in->arg[0].any_svp;
+
+    save_pushptrptr(*slot, slot, (int)in->type);   /* (current outer, slot) */
+    *slot = in->arg[1].any_sv;                      /* reinstall localized   */
+}
+
+/* --- SAVEt_ITEM (localized SV value via sv_replace) ----------------------- *
+ *
+ * save_item snapshots an SV's value (newSVsv) and leave_scope sv_replace()s the
+ * snapshot back into it.  ap[0] = the target SV (persistent identity),
+ * ap[1] = the outer-value snapshot (consumed by sv_replace).  freeze snapshots
+ * the current (localized) value, replaces the outer snapshot back into the
+ * target, and retains the localized snapshot; thaw re-snapshots the (now outer)
+ * value via save_item and sv_replace()s the localized value back in.  Magical
+ * targets are refused (leave_scope runs set-magic on them).
+ *
+ * Frozen entry layout:  arg[0] = target SV (borrowed)
+ *                       arg[1] = localized value snapshot (ref retained)
+ */
+
+static bool
+S_can_freeze_item(pTHX_ const ANY *ap, UV uv)
+{
+    PERL_UNUSED_ARG(uv);
+    return !SvSMAGICAL(ap[0].any_sv);
+}
+
+static void
+S_freeze_item(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    SV *item = ap[0].any_sv;
+
+    PERL_UNUSED_ARG(uv);
+    out->arg[1].any_sv = newSVsv(item);   /* snapshot the localized value    */
+    sv_replace(item, ap[1].any_sv);        /* item := outer (consumes ap[1])  */
+    out->arg[0].any_sv = item;             /* borrowed target                 */
+}
+
+static void
+S_thaw_item(pTHX_ const SavedEntry *in)
+{
+    SV *item = in->arg[0].any_sv;
+
+    save_item(item);                       /* re-snapshot outer, push SAVEt_ITEM */
+    sv_replace(item, in->arg[1].any_sv);   /* item := localized (consumes)       */
+}
+
+static void
+S_discard_item(pTHX_ SavedEntry *entry)
+{
+    SvREFCNT_dec(entry->arg[1].any_sv);    /* localized snapshot */
+}
+
+static void
+S_walk_item(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    cb(aTHX_ in->arg[1].any_sv, "SAVEt_ITEM localized value", ud);
+}
+
+/* --- Deferred-action / bookkeeping save types ---------------------------- *
+ *
+ * Unlike the value-localization types above, these do not restore an outer
+ * value - they register an ACTION to run when the scope exits: free an SV / PV
+ * / op, mortalize an SV, call a destructor or "finally" block, restore SvFLAGS,
+ * etc.
+ *
+ * Cancel semantics (decided): savestack_frozen_free() RUNS the action, because
+ * cancelling a suspended scope tears it down as if it had been left normally -
+ * RAII-style cleanups (destructors, finally blocks, frees) must execute,
+ * exactly as leave_scope would run them (and as Future::AsyncAwait already runs
+ * finally blocks on cancel).  So: freeze() lifts the action off the live save
+ * stack, taking ownership of any resource it holds; thaw() re-registers it so
+ * it runs at the eventual real scope exit; discard() executes it.  freeze()
+ * itself never runs the action.
+ *
+ * Covered: the 1-arg pointer actions SAVEt_FREESV / FREEPV / FREEOP /
+ * FREEPADNAME / FREECOPHH / FREERCPV / MORTALIZESV / READONLY_OFF
+ * (S_thaw_action1 / S_discard_action1); SAVEt_DESTRUCTOR / DESTRUCTOR_X
+ * (S_*_destructor); SAVEt_SET_SVFLAGS (S_*_setflags).  All share S_freeze_action
+ * (a straight capture of the arg slots - ownership of any held resource simply
+ * transfers from the live stack into the blob).
+ *
+ * Resources these hold (an SV ref, a malloc'd PV, a destructor's data) are
+ * borrowed by / owned by the blob until it is thawed or freed; a blob that is
+ * neither thawed nor freed leaks them, exactly as leaking a live scope would.
+ */
+
+static void
+S_freeze_action(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    U8 i;
+    PERL_UNUSED_ARG(uv);
+    for (i = 0; i < out->nargs; i++)
+        out->arg[i] = ap[i];
+}
+
+static void
+S_thaw_action1(pTHX_ const SavedEntry *in)
+{
+    save_pushptr(in->arg[0].any_ptr, (int)in->type);
+}
+
+static void
+S_discard_action1(pTHX_ SavedEntry *entry)
+{
+    void *p = entry->arg[0].any_ptr;
+    switch (entry->type) {
+    case SAVEt_FREESV:       SvREFCNT_dec((SV *)p);              break;
+    case SAVEt_MORTALIZESV:  sv_2mortal((SV *)p);                break;
+    case SAVEt_FREEPV:       Safefree(p);                        break;
+    case SAVEt_FREEOP:       op_free((OP *)p);                   break;
+    case SAVEt_FREEPADNAME:  PadnameREFCNT_dec((PADNAME *)p);    break;
+    case SAVEt_FREECOPHH:    cophh_free((COPHH *)p);             break;
+    case SAVEt_FREERCPV:     (void)rcpv_free((char *)p);         break;
+    case SAVEt_READONLY_OFF: SvREADONLY_off((SV *)p);            break;
+    default:                 NOT_REACHED; /* NOTREACHED */
+    }
+}
+
+static void
+S_walk_action1(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    switch (in->type) {
+    case SAVEt_FREESV:       cb(aTHX_ in->arg[0].any_sv, "SAVEt_FREESV",       ud); break;
+    case SAVEt_MORTALIZESV:  cb(aTHX_ in->arg[0].any_sv, "SAVEt_MORTALIZESV",  ud); break;
+    case SAVEt_READONLY_OFF: cb(aTHX_ in->arg[0].any_sv, "SAVEt_READONLY_OFF", ud); break;
+    default: break;         /* opaque resources (PV / OP / PADNAME / COPHH / RCPV) */
+    }
+}
+
+static void
+S_thaw_destructor(pTHX_ const SavedEntry *in)
+{
+    dSS_ADD;
+    if (in->type == SAVEt_DESTRUCTOR)
+        SS_ADD_DPTR(in->arg[0].any_dptr);
+    else
+        SS_ADD_DXPTR(in->arg[0].any_dxptr);
+    SS_ADD_PTR(in->arg[1].any_ptr);
+    SS_ADD_UV((UV)in->type);
+    SS_ADD_END(3);
+}
+
+/* Run a parked SAVEDESTRUCTOR / SAVEDESTRUCTOR_X - a deferred *user* callback
+ * (e.g. a Syntax::Keyword defer / try-finally block).  Driven only by
+ * savestack_frozen_run_deferred, NOT by frozen_free, so a consumer that merely
+ * discards a suspended scope does not fire user-visible finalizers. */
+static void
+S_run_destructor(pTHX_ SavedEntry *entry)
+{
+    if (entry->type == SAVEt_DESTRUCTOR)
+        (*entry->arg[0].any_dptr)(entry->arg[1].any_ptr);
+    else
+        (*entry->arg[0].any_dxptr)(aTHX_ entry->arg[1].any_ptr);
+}
+
+static void
+S_thaw_setflags(pTHX_ const SavedEntry *in)
+{
+    dSS_ADD;
+    SS_ADD_PTR(in->arg[0].any_sv);
+    SS_ADD_INT(in->arg[1].any_i32);
+    SS_ADD_INT(in->arg[2].any_i32);
+    SS_ADD_UV((UV)SAVEt_SET_SVFLAGS);
+    SS_ADD_END(4);
+}
+
+static void
+S_discard_setflags(pTHX_ SavedEntry *entry)
+{
+    SV *sv = entry->arg[0].any_sv;
+    SvFLAGS(sv) &= ~(entry->arg[1].any_u32);
+    SvFLAGS(sv) |=   entry->arg[2].any_u32;
+}
+
+/* --- SAVEt_GENERIC_PVREF / SHARED_PVREF / RCPV (localized char* slots) ---- *
+ *
+ * char* analogues of GENERIC_SVREF: a pointer slot whose value is restored, and
+ * whose localized value is freed, at scope exit.  The slot/outer arg order and
+ * the free function differ:
+ *   GENERIC_PVREF: ap[0]=outer pv, ap[1]=char** slot   -> Safefree
+ *   SHARED_PVREF : ap[0]=char** slot, ap[1]=outer pv   -> PerlMemShared_free
+ *   RCPV         : ap[0]=char** slot, ap[1]=+1 rcpv copy of outer (rc-counted)
+ *
+ * For GENERIC/SHARED, leave_scope only frees/sets when the value changed, so
+ * freeze reverts the slot (when changed) and retains the localized pv; discard
+ * frees it (guarded the same way).  RCPV is ref-counted: freeze installs the
+ * outer copy and releases its extra ref, retaining the localized reference for
+ * discard.  No SVs are owned, so walk stays NULL.
+ *
+ * Frozen entry: arg[0]=slot (char**), arg[1]=localized pv,
+ *               arg[2]=outer pv (GENERIC/SHARED only).
+ */
+
+static void
+S_freeze_pvref(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    const U8 type    = (U8)uv & SAVE_MASK;
+    char   **slot    = (type == SAVEt_GENERIC_PVREF) ? ap[1].any_pvp : ap[0].any_pvp;
+    char    *outer   = (type == SAVEt_GENERIC_PVREF) ? ap[0].any_pv  : ap[1].any_pv;
+    char    *localized = *slot;
+
+    if (localized != outer)
+        *slot = outer;                 /* revert (leave_scope guards on !=) */
+
+    out->arg[0].any_pvp = slot;
+    out->arg[1].any_pv  = localized;
+    out->arg[2].any_pv  = outer;
+}
+
+static void
+S_thaw_pvref(pTHX_ const SavedEntry *in)
+{
+    char **slot = in->arg[0].any_pvp;
+
+    if (in->type == SAVEt_GENERIC_PVREF)
+        save_pushptrptr(*slot, slot, SAVEt_GENERIC_PVREF);   /* (outer, slot) */
+    else
+        save_pushptrptr(slot, *slot, SAVEt_SHARED_PVREF);    /* (slot, outer) */
+    *slot = in->arg[1].any_pv;
+}
+
+static void
+S_discard_pvref(pTHX_ SavedEntry *entry)
+{
+    char *localized = entry->arg[1].any_pv;
+
+    if (localized != entry->arg[2].any_pv) {                 /* value did change */
+        if (entry->type == SAVEt_GENERIC_PVREF)
+            Safefree(localized);
+        else
+            PerlMemShared_free(localized);
+    }
+}
+
+static void
+S_freeze_rcpv(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    char **slot      = ap[0].any_pvp;
+    char  *localized = *slot;
+
+    PERL_UNUSED_ARG(uv);
+    *slot = ap[1].any_pv;              /* outer copy (+1) */
+    (void)rcpv_free(ap[1].any_pv);     /* release the +1; slot holds outer     */
+
+    out->arg[0].any_pvp = slot;
+    out->arg[1].any_pv  = localized;   /* retained rcpv reference               */
+}
+
+static void
+S_thaw_rcpv(pTHX_ const SavedEntry *in)
+{
+    char **slot = in->arg[0].any_pvp;
+
+    save_pushptrptr(slot, rcpv_copy(*slot), SAVEt_RCPV);     /* (slot, +1 copy) */
+    *slot = in->arg[1].any_pv;
+}
+
+static void
+S_discard_rcpv(pTHX_ SavedEntry *entry)
+{
+    (void)rcpv_free(entry->arg[1].any_pv);                   /* retained ref */
+}
+
+/* --- SAVEt_CLEARSV / SAVEt_CLEARPADRANGE (pad-slot clear bookkeeping) ------ *
+ *
+ * A deferred "clear this pad slot (or range) at scope exit" action.  The whole
+ * entry is the single type-tagged UV pushed by save_clearsv / the CLEARPADRANGE
+ * op (the pad offset, and for a range the count, packed above SAVE_MASK); there
+ * is no separate arg slot and no value to park.  freeze must NOT run the clear
+ * (the lexical has to survive the suspension) and in any case the clear is
+ * relative to PL_curpad, which is only the intended pad while the suspended
+ * frame is live - so it can only be re-run by a real leave_scope once the
+ * consumer has re-established that pad.  We therefore just carry the UV across
+ * and re-push it verbatim.  Nothing is owned (the pad slot's SV belongs to the
+ * pad and is freed with it), so discard and walk are NULL and cancel drops it.
+ *
+ * Frozen entry: arg[0].any_uv = the packed type-word.
+ */
+
+static void
+S_freeze_padclear(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    PERL_UNUSED_ARG(ap);
+    out->arg[0].any_uv = uv;            /* offset[/count] | SAVEt_* : re-push as-is */
+}
+
+static void
+S_thaw_padclear(pTHX_ const SavedEntry *in)
+{
+    dSS_ADD;
+    SS_ADD_UV(in->arg[0].any_uv);
+    SS_ADD_END(1);
+}
+
+/* --- SAVEt_COMPPAD (PL_comppad / PL_curpad bookkeeping) -------------------- *
+ *
+ * A non-refcounted save of the compiling pad pointer (save_pushptr; leave_scope
+ * restores it with a plain PL_comppad/PL_curpad assignment).  freeze reverts the
+ * globals to the outer pad exactly as leave_scope would and keeps the localized
+ * pad pointer so thaw can reinstall it; thaw re-pushes a SAVEt_COMPPAD saving the
+ * outer and restores the localized globals.  The pad AV is owned by its CV, not
+ * by this entry, so nothing is refcounted and discard/walk are NULL.  (Pad
+ * *contents* are the consumer's responsibility - see
+ * F<Porting/savestack_suspend_api.md> Sec 1.6.)
+ *
+ * Frozen entry: arg[0].any_ptr = outer pad, arg[1].any_ptr = localized pad.
+ */
+
+static void
+S_freeze_comppad(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    PERL_UNUSED_ARG(uv);
+    out->arg[0].any_ptr = ap[0].any_ptr;        /* outer (saved) pad    */
+    out->arg[1].any_ptr = PL_comppad;           /* localized (current)  */
+
+    PL_comppad = (PAD *)ap[0].any_ptr;          /* revert (leave_scope) */
+    PL_curpad  = PL_comppad ? AvARRAY(PL_comppad) : NULL;
+}
+
+static void
+S_thaw_comppad(pTHX_ const SavedEntry *in)
+{
+    PL_comppad = (PAD *)in->arg[0].any_ptr;               /* outer               */
+    save_pushptr(MUTABLE_SV(PL_comppad), SAVEt_COMPPAD);  /* re-save outer       */
+    PL_comppad = (PAD *)in->arg[1].any_ptr;               /* reinstall localized */
+    PL_curpad  = PL_comppad ? AvARRAY(PL_comppad) : NULL;
+}
+
+/* --- SAVEt_PADSV_AND_MORTALIZE (localized pad slot, mortalize-on-restore) -- *
+ *
+ * save_padsv_and_mortalize pushed (SvREFCNT_inc'd outer SV, comppad, offset);
+ * leave_scope mortalizes the current slot SV and restores the outer into the
+ * slot.  The pad and offset in the entry locate the slot independently of the
+ * live PL_curpad (unlike CLEARSV), so this is fully relocatable.  freeze mirrors
+ * leave_scope but *parks* the localized SV - taking over the slot's reference -
+ * instead of mortalizing it, and moves the saved outer's reference into the
+ * slot.  thaw moves the slot's outer reference onto a fresh save entry and
+ * reinstalls the localized SV.  On cancel the outer stays live in the pad slot
+ * (owned by the pad), so discard drops only the parked localized reference.
+ *
+ * Frozen entry: arg[0].any_ptr = pad (PAD*), arg[1].any_uv = pad offset,
+ *               arg[2].any_sv = parked localized SV (one owned reference).
+ */
+
+static void
+S_freeze_padsv(pTHX_ const ANY *ap, UV uv, SavedEntry *out)
+{
+    SV **svp = AvARRAY((PAD *)ap[1].any_ptr) + (PADOFFSET)ap[2].any_uv;
+
+    PERL_UNUSED_ARG(uv);
+    out->arg[0].any_ptr = ap[1].any_ptr;   /* pad (borrowed; relocates the slot) */
+    out->arg[1].any_uv  = ap[2].any_uv;    /* pad offset                          */
+    out->arg[2].any_sv  = *svp;            /* park localized: take the slot's ref */
+
+    *svp = ap[0].any_sv;                   /* slot := outer (save entry's ref)    */
+}
+
+static void
+S_thaw_padsv(pTHX_ const SavedEntry *in)
+{
+    SV **svp = AvARRAY((PAD *)in->arg[0].any_ptr) + (PADOFFSET)in->arg[1].any_uv;
+    dSS_ADD;
+
+    SS_ADD_PTR(*svp);                      /* outer: move the slot's ref onto SS  */
+    SS_ADD_PTR(in->arg[0].any_ptr);        /* comppad                             */
+    SS_ADD_UV(in->arg[1].any_uv);          /* offset                              */
+    SS_ADD_UV(SAVEt_PADSV_AND_MORTALIZE);
+    SS_ADD_END(4);
+
+    *svp = in->arg[2].any_sv;              /* reinstall localized (parked ref)    */
+}
+
+static void
+S_discard_padsv(pTHX_ SavedEntry *entry)
+{
+    SvREFCNT_dec(entry->arg[2].any_sv);    /* parked localized; outer stays in pad */
+}
+
+static void
+S_walk_padsv(pTHX_ const SavedEntry *in, PerlSavestackFrozenSVCb cb, void *ud)
+{
+    cb(aTHX_ in->arg[2].any_sv, "SAVEt_PADSV_AND_MORTALIZE localized value", ud);
+}
+
+/* Cover the whole SAVE_MASK range so a corrupt/out-of-range type still indexes
+ * a defined (non-relocatable) row rather than reading past the array. */
+#define SAVETYPE_RELOC_MAX (SAVE_MASK + 1)      /* 64 */
+
+/* Rows not listed default to { relocatable = FALSE, NULL... } => freeze croaks.
+ * Later increments add rows as their handlers land. */
+static const savetype_reloc S_savetype_reloc[SAVETYPE_RELOC_MAX] = {
+    [SAVEt_SV]    = { TRUE, S_can_freeze_sv, S_freeze_sv, S_thaw_sv,
+                      S_discard_sv, S_walk_sv },
+    [SAVEt_SVREF] = { TRUE, S_can_freeze_sv, S_freeze_sv, S_thaw_sv,
+                      S_discard_sv, S_walk_sv },
+    [SAVEt_AV]    = { TRUE, S_can_freeze_avhv, S_freeze_avhv, S_thaw_avhv,
+                      S_discard_avhv, S_walk_avhv },
+    [SAVEt_HV]    = { TRUE, S_can_freeze_avhv, S_freeze_avhv, S_thaw_avhv,
+                      S_discard_avhv, S_walk_avhv },
+    [SAVEt_HELEM] = { TRUE, S_can_freeze_elem, S_freeze_elem, S_thaw_elem,
+                      S_discard_elem, S_walk_elem },
+    [SAVEt_AELEM] = { TRUE, S_can_freeze_elem, S_freeze_elem, S_thaw_elem,
+                      S_discard_elem, S_walk_elem },
+    [SAVEt_DELETE]  = { TRUE, S_can_freeze_delete, S_freeze_delete, S_thaw_delete,
+                        S_discard_delete, S_walk_delete },
+    [SAVEt_ADELETE] = { TRUE, S_can_freeze_delete, S_freeze_delete, S_thaw_delete,
+                        S_discard_delete, S_walk_delete },
+    [SAVEt_GVSV]         = { TRUE, NULL, S_freeze_svp, S_thaw_svp,
+                             S_discard_svp, S_walk_svp },
+    [SAVEt_GENERIC_SVREF] = { TRUE, NULL, S_freeze_svp, S_thaw_svp,
+                             S_discard_svp, S_walk_svp },
+    [SAVEt_INT]         = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_INT_SMALL]   = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_IV]          = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_I32]         = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_I32_SMALL]   = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_I16]         = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_I8]          = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_BOOL]        = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_STRLEN]      = { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_STRLEN_SMALL]= { TRUE, NULL, S_freeze_cint, S_thaw_cint, NULL, NULL },
+    [SAVEt_SPTR]        = { TRUE, NULL, S_freeze_ptr, S_thaw_ptr, NULL, NULL },
+    [SAVEt_VPTR]        = { TRUE, NULL, S_freeze_ptr, S_thaw_ptr, NULL, NULL },
+    [SAVEt_PPTR]        = { TRUE, NULL, S_freeze_ptr, S_thaw_ptr, NULL, NULL },
+    [SAVEt_HPTR]        = { TRUE, NULL, S_freeze_ptr, S_thaw_ptr, NULL, NULL },
+    [SAVEt_APTR]        = { TRUE, NULL, S_freeze_ptr, S_thaw_ptr, NULL, NULL },
+    [SAVEt_ITEM]        = { TRUE, S_can_freeze_item, S_freeze_item, S_thaw_item,
+                            S_discard_item, S_walk_item },
+    [SAVEt_FREESV]      = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_MORTALIZESV] = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_FREEPV]      = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_FREEOP]      = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_FREEPADNAME] = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_FREECOPHH]   = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_FREERCPV]    = { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_READONLY_OFF]= { TRUE, NULL, S_freeze_action, S_thaw_action1,
+                            S_discard_action1, S_walk_action1 },
+    [SAVEt_DESTRUCTOR]  = { TRUE, NULL, S_freeze_action, S_thaw_destructor,
+                            NULL, NULL },   /* run via savestack_frozen_run_deferred */
+    [SAVEt_DESTRUCTOR_X]= { TRUE, NULL, S_freeze_action, S_thaw_destructor,
+                            NULL, NULL },   /* run via savestack_frozen_run_deferred */
+    [SAVEt_SET_SVFLAGS] = { TRUE, NULL, S_freeze_action, S_thaw_setflags,
+                            S_discard_setflags, NULL },
+    [SAVEt_GENERIC_PVREF]={ TRUE, NULL, S_freeze_pvref, S_thaw_pvref,
+                            S_discard_pvref, NULL },
+    [SAVEt_SHARED_PVREF] = { TRUE, NULL, S_freeze_pvref, S_thaw_pvref,
+                            S_discard_pvref, NULL },
+    [SAVEt_RCPV]        = { TRUE, NULL, S_freeze_rcpv, S_thaw_rcpv,
+                            S_discard_rcpv, NULL },
+    [SAVEt_CLEARSV]      = { TRUE, NULL, S_freeze_padclear, S_thaw_padclear,
+                             NULL, NULL },
+    [SAVEt_CLEARPADRANGE]= { TRUE, NULL, S_freeze_padclear, S_thaw_padclear,
+                             NULL, NULL },
+    [SAVEt_COMPPAD]      = { TRUE, NULL, S_freeze_comppad, S_thaw_comppad,
+                             NULL, NULL },
+    [SAVEt_PADSV_AND_MORTALIZE] = { TRUE, NULL, S_freeze_padsv, S_thaw_padsv,
+                             S_discard_padsv, S_walk_padsv },
+};
+
+PERL_STATIC_INLINE const savetype_reloc *
+S_savetype_reloc_for(U8 type)
+{
+    assert(type < SAVETYPE_RELOC_MAX);
+    return &S_savetype_reloc[type];
+}
+
+#define SAVESTACK_FROZEN_MIN 8
+
+static void
+S_frozen_grow(pTHX_ PerlSavestackFrozen *frozen)
+{
+    const U32 newmax = frozen->max ? (frozen->max << 1) : SAVESTACK_FROZEN_MIN;
+    Renew(frozen->entries, newmax, SavedEntry);
+    frozen->max = newmax;
+}
+
+/*
+=for apidoc_section $callback
+=for apidoc savestack_freeze
+
+Freeze the region of the save stack from C<base_ix> up to the current
+C<PL_savestack_ix>: serialize each entry into a newly allocated opaque
+C<PerlSavestackFrozen> blob and unwind it off the live save stack, reverting
+each localized target to its outer value.  Afterwards C<PL_savestack_ix> equals
+C<base_ix>.  The returned blob may later be re-applied with
+L</C<savestack_thaw>> or discarded with L</C<savestack_frozen_free>>.
+
+This lets a suspend-a-scope consumer such as Future::AsyncAwait or Coro lift a
+region of dynamic scope (the effects of C<local> and friends) off the
+interpreter across a suspension point and re-apply it later, instead of
+re-implementing C<leave_scope> in reverse.  Freezing an empty region succeeds
+and returns an empty blob.
+
+Croaks, leaving the save stack unchanged, if the region contains a save type
+that cannot be suspended (for example C<local> on a tied or magical target,
+which is not yet supported).  See F<Porting/savestack_suspend_api.md>.
+
+B<Note:> this API is new and considered experimental.
+
+=cut
+*/
+
+PerlSavestackFrozen *
+Perl_savestack_freeze(pTHX_ I32 base_ix)
+{
+    PerlSavestackFrozen *frozen;
+    I32 ix;
+
+    if (UNLIKELY(base_ix < 0 || base_ix > PL_savestack_ix))
+        croak("panic: savestack_freeze: bad base index %ld (ix=%ld)",
+              (long)base_ix, (long)PL_savestack_ix);
+
+    /* Pass 1: verify the whole region can be suspended, mutating nothing, so a
+     * refusal leaves the save stack intact (never corrupt - Sec 1.5).  The walk
+     * uses leave_scope_arg_counts[]; a non-relocatable type is refused the
+     * moment it is reached, before its (possibly variable) width is trusted. */
+    ix = PL_savestack_ix;
+    while (ix > base_ix) {
+        const UV  uv    = PL_savestack[ix - 1].any_uv;
+        const U8  type  = (U8)uv & SAVE_MASK;
+        const U8  nargs = leave_scope_arg_counts[type];
+        const savetype_reloc *r = S_savetype_reloc_for(type);
+
+        if (!r->relocatable)
+            croak("savestack_freeze: cannot suspend save type %d "
+                  "(not relocatable); see Porting/savestack_suspend_api.md",
+                  (int)type);
+        if (UNLIKELY(ix - 1 - (I32)nargs < base_ix))
+            croak("panic: savestack_freeze: save type %d straddles base %ld",
+                  (int)type, (long)base_ix);
+        if (r->can_freeze
+            && !r->can_freeze(aTHX_ &PL_savestack[ix - 1 - nargs], uv))
+            croak("savestack_freeze: cannot suspend this instance of save "
+                  "type %d; see Porting/savestack_suspend_api.md", (int)type);
+
+        ix -= (I32)nargs + 1;
+    }
+    if (UNLIKELY(ix != base_ix))
+        croak("panic: savestack_freeze: region does not end on a save "
+              "boundary (ix=%ld base=%ld)", (long)ix, (long)base_ix);
+
+    /* Pass 2: park + capture, unwinding to base_ix.  Every entry passed pass 1,
+     * so no handler here croaks and the blob is always fully built. */
+    Newxz(frozen, 1, PerlSavestackFrozen);
+    while (PL_savestack_ix > base_ix) {
+        const I32 top   = PL_savestack_ix - 1;
+        const UV  uv    = PL_savestack[top].any_uv;
+        const U8  type  = (U8)uv & SAVE_MASK;
+        const U8  nargs = leave_scope_arg_counts[type];
+        const savetype_reloc *r = S_savetype_reloc_for(type);
+        SavedEntry *out;
+
+        assert(r->relocatable && r->freeze);
+        if (frozen->len == frozen->max)
+            S_frozen_grow(aTHX_ frozen);
+        out = &frozen->entries[frozen->len];
+        out->type  = type;
+        out->nargs = nargs;
+        r->freeze(aTHX_ &PL_savestack[top - nargs], uv, out);
+        frozen->len++;
+        PL_savestack_ix = top - nargs;
+    }
+
+    return frozen;
+}
+
+/*
+=for apidoc savestack_thaw
+
+Re-apply a blob previously produced by L</C<savestack_freeze>> onto the live
+save stack, re-pushing an equivalent save entry for each frozen entry (so a
+later ordinary C<leave_scope> restores and frees correctly) and re-installing
+each localized value.  The blob is consumed (freed).  The caller is responsible
+for C<PL_savestack_ix> being at the base the entries should be re-applied from.
+A NULL blob is a no-op.
+
+B<Note:> this API is new and considered experimental.
+
+=cut
+*/
+
+void
+Perl_savestack_thaw(pTHX_ PerlSavestackFrozen *frozen)
+{
+    U32 i;
+
+    if (!frozen)
+        return;
+
+    /* Replay in reverse capture order: entry[len-1] sat closest to the base and
+     * was pushed first originally, so it must be re-pushed first. */
+    i = frozen->len;
+    while (i-- > 0) {
+        const SavedEntry *e = &frozen->entries[i];
+        const savetype_reloc *r = S_savetype_reloc_for(e->type);
+        assert(r->thaw);
+        r->thaw(aTHX_ e);
+    }
+
+    /* Every retained ref has been transferred back onto the live save stack /
+     * into its slot, so free the blob shell WITHOUT running discard. */
+    Safefree(frozen->entries);
+    Safefree(frozen);
+}
+
+/*
+=for apidoc savestack_frozen_free
+
+Discard a blob from L</C<savestack_freeze>> that will never be thawed (for
+example a cancelled suspension), dropping any references it owns and freeing any
+owned resources.  The parked outer values are already live in their slots and
+are left untouched.  Deferred B<user callbacks> registered with C<SAVEDESTRUCTOR>
+/ C<SAVEDESTRUCTOR_X> (e.g. C<defer> and C<try>/C<finally> blocks) are B<not> run
+here; a consumer that wants them to fire on cancellation must call
+L</C<savestack_frozen_run_deferred>> first.  A NULL blob is a no-op.
+
+B<Note:> this API is new and considered experimental.
+
+=cut
+*/
+
+void
+Perl_savestack_frozen_free(pTHX_ PerlSavestackFrozen *frozen)
+{
+    U32 i;
+
+    if (!frozen)
+        return;
+
+    for (i = 0; i < frozen->len; i++) {
+        SavedEntry *e = &frozen->entries[i];
+        const savetype_reloc *r = S_savetype_reloc_for(e->type);
+        if (r->discard)
+            r->discard(aTHX_ e);
+    }
+    Safefree(frozen->entries);
+    Safefree(frozen);
+}
+
+/*
+=for apidoc savestack_frozen_run_deferred
+
+Run the deferred B<user callbacks> parked in a frozen blob - those registered
+with C<SAVEDESTRUCTOR> / C<SAVEDESTRUCTOR_X> (e.g. C<defer> and C<try>/C<finally>
+blocks) - in the order a real C<leave_scope> would (most-recently-entered
+first).  Intended for a consumer that is cancelling a suspended scope and wants
+those finalizers to fire as they would on an ordinary scope exit.  This does
+B<not> free the blob or drop any references - call L</C<savestack_frozen_free>>
+afterwards to reclaim it.  Calling it more than once runs the callbacks more
+than once.  A NULL blob is a no-op.
+
+B<Note:> this API is new and considered experimental.
+
+=cut
+*/
+
+void
+Perl_savestack_frozen_run_deferred(pTHX_ PerlSavestackFrozen *frozen)
+{
+    U32 i;
+
+    if (!frozen)
+        return;
+
+    /* entries[0] is the top-most (last-entered) scope, so forward iteration
+     * fires finalizers most-recently-entered first, matching leave_scope. */
+    for (i = 0; i < frozen->len; i++) {
+        SavedEntry *e = &frozen->entries[i];
+        if (e->type == SAVEt_DESTRUCTOR || e->type == SAVEt_DESTRUCTOR_X)
+            S_run_destructor(aTHX_ e);
+    }
+}
+
+/*
+=for apidoc savestack_frozen_foreach_sv
+
+Enumerate every SV a frozen blob retains, invoking C<cb> once per SV as
+S<C<cb(aTHX_ sv, desc, ud)>>, where C<desc> is a static human-readable label
+and C<ud> is the opaque data passed through unchanged.  Intended for
+Devel::MAT-style tooling that needs to see into a suspended scope.  The SVs are
+borrowed (not reference-counted for the callback); C<cb> must not free them.  A
+NULL blob is a no-op.
+
+B<Note:> this API is new and considered experimental.
+
+=cut
+*/
+
+void
+Perl_savestack_frozen_foreach_sv(pTHX_ PerlSavestackFrozen *frozen,
+                                 PerlSavestackFrozenSVCb cb, void *ud)
+{
+    U32 i;
+
+    PERL_ARGS_ASSERT_SAVESTACK_FROZEN_FOREACH_SV;
+
+    if (!frozen)
+        return;
+
+    for (i = 0; i < frozen->len; i++) {
+        const SavedEntry *e = &frozen->entries[i];
+        const savetype_reloc *r = S_savetype_reloc_for(e->type);
+        if (r->walk)
+            r->walk(aTHX_ e, cb, ud);
+    }
+}
+
 void
 Perl_cx_dump(pTHX_ PERL_CONTEXT *cx)
 {

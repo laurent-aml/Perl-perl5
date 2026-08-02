@@ -4213,6 +4213,23 @@ Perl_savesharedpvn(pTHX_ const char * const pv, const STRLEN len)
         __attribute__warn_unused_result__;
 #define PERL_ARGS_ASSERT_SAVESHAREDPVN
 
+PERL_CALLCONV PerlSavestackFrozen *
+Perl_savestack_freeze(pTHX_ I32 base_ix);
+#define PERL_ARGS_ASSERT_SAVESTACK_FREEZE
+
+PERL_CALLCONV void
+Perl_savestack_frozen_foreach_sv(pTHX_ PerlSavestackFrozen *frozen, PerlSavestackFrozenSVCb cb, void *ud);
+#define PERL_ARGS_ASSERT_SAVESTACK_FROZEN_FOREACH_SV \
+        assert(cb)
+
+PERL_CALLCONV void
+Perl_savestack_frozen_free(pTHX_ PerlSavestackFrozen *frozen);
+#define PERL_ARGS_ASSERT_SAVESTACK_FROZEN_FREE
+
+PERL_CALLCONV void
+Perl_savestack_frozen_run_deferred(pTHX_ PerlSavestackFrozen *frozen);
+#define PERL_ARGS_ASSERT_SAVESTACK_FROZEN_RUN_DEFERRED
+
 PERL_CALLCONV void
 Perl_savestack_grow(pTHX);
 #define PERL_ARGS_ASSERT_SAVESTACK_GROW
@@ -4220,6 +4237,10 @@ Perl_savestack_grow(pTHX);
 PERL_CALLCONV void
 Perl_savestack_grow_cnt(pTHX_ I32 need);
 #define PERL_ARGS_ASSERT_SAVESTACK_GROW_CNT
+
+PERL_CALLCONV void
+Perl_savestack_thaw(pTHX_ PerlSavestackFrozen *frozen);
+#define PERL_ARGS_ASSERT_SAVESTACK_THAW
 
 PERL_CALLCONV void
 Perl_savetmps(pTHX);

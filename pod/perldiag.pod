@@ -5950,6 +5950,21 @@ for the character.
 (W syntax) You wrote your assignment operator backwards.  The = must
 always come last, to avoid ambiguity with subsequent unary operators.
 
+=item savestack_freeze: cannot suspend save type %d (not relocatable); see Porting/savestack_suspend_api.md
+
+(F) A module asked to freeze a region of the save stack (see
+F<Porting/savestack_suspend_api.md>) that contains an entry of a kind which
+cannot be moved to another stack - one holding a pointer into the stack it lives
+on, for instance. The save stack is left exactly as it was; nothing has been
+suspended.
+
+=item savestack_freeze: cannot suspend this instance of save type %d; see Porting/savestack_suspend_api.md
+
+(F) As above, except that the kind of save-stack entry is relocatable in general
+and this particular one is not - it refers to something that only makes sense on
+the scope being left behind. Again nothing has been suspended, and the save stack
+is unchanged.
+
 =item Scalars leaked: %d
 
 (S internal) Something went wrong in Perl's internal bookkeeping
