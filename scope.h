@@ -10,6 +10,25 @@
 
 #include "scope_types.h"
 
+/* Opaque handle for a frozen (suspended) region of the save stack, produced by
+ * Perl_savestack_freeze() and consumed by Perl_savestack_thaw() /
+ * Perl_savestack_frozen_free().  Lets suspend-a-scope consumers such as
+ * Future::AsyncAwait and Coro lift a dynamic scope off the interpreter and
+ * re-apply it later without re-implementing leave_scope in reverse.  See
+ * Porting/savestack_suspend_api.md.  The layout is private to scope.c. */
+typedef struct PerlSavestackFrozen PerlSavestackFrozen;
+
+/* Feature macro: consumers (Future::AsyncAwait, Coro, ...) can test
+ * #ifdef PERL_SAVESTACK_SUSPEND to detect the freeze/thaw/frozen_free/
+ * frozen_foreach_sv API described in Porting/savestack_suspend_api.md. */
+#define PERL_SAVESTACK_SUSPEND 1
+
+/* Callback for Perl_savestack_frozen_foreach_sv(): invoked once per SV a frozen
+ * blob retains.  C<desc> is a static human-readable label (e.g. for Devel::MAT);
+ * C<ud> is the caller's opaque data.  The SV is borrowed - do not free it. */
+typedef void (*PerlSavestackFrozenSVCb)(pTHX_ SV *sv, const char *desc,
+                                        void *ud);
+
 #define SAVEf_SETMAGIC		1
 #define SAVEf_KEEPOLDELEM	2
 
