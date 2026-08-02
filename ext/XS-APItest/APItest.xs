@@ -8269,6 +8269,111 @@ get_savestack_ix()
     OUTPUT:
         RETVAL
 
+MODULE = XS::APItest            PACKAGE = XS::APItest::execstate
+
+# Snapshot the live execution registers with execstate_save, load them straight
+# back, and confirm the round-trip is register-exact.
+IV
+roundtrip_ok()
+    CODE:
+    {
+        PerlExecState a, b;
+        execstate_save(&a);
+        execstate_load(&a);
+        execstate_save(&b);
+        RETVAL = a.savestack_ix  == b.savestack_ix
+              && a.scopestack_ix == b.scopestack_ix
+              && a.tmps_ix       == b.tmps_ix
+              && a.stack_sp      == b.stack_sp
+              && a.curstackinfo  == b.curstackinfo
+              && a.markstack_ptr == b.markstack_ptr
+              && a.op            == b.op;
+    }
+    OUTPUT:
+        RETVAL
+
+# Level 2 (lifecycle): snapshot the caller, stand up a fresh independent set of
+# stacks as the live ones, check the fresh-context invariants, then unwind and
+# free them and restore the caller - the sequence a green thread performs.
+# save/load do not cover PL_mainstack, so we save/restore it by hand.
+IV
+lifecycle_ok()
+    CODE:
+    {
+        PerlExecState saved;
+        AV *saved_mainstack = PL_mainstack;
+        int ok = 1;
+
+        execstate_save(&saved);
+
+        execstate_init(0);
+        ok = ok && PL_stack_sp    == PL_stack_base;
+        ok = ok && PL_tmps_ix     == -1;
+        ok = ok && PL_tmps_floor  == -1;
+        ok = ok && PL_scopestack_ix == 0;
+        ok = ok && PL_curstackinfo->si_type == PERLSI_MAIN;
+        ok = ok && PL_curstackinfo != saved.curstackinfo;
+
+        execstate_unwind();
+        execstate_destroy();
+
+        execstate_load(&saved);
+        PL_mainstack = saved_mainstack;
+
+        RETVAL = ok;
+    }
+    OUTPUT:
+        RETVAL
+
+# Level 3 (pad): derive a private padlist for a sub, confirm it is a distinct
+# padlist that shares the original's name pad and has a value pad, then free it.
+IV
+padlist_ok(SV *coderef)
+    CODE:
+    {
+        CV *cv = (CV *)SvRV(coderef);
+        PADLIST *orig = CvPADLIST(cv);
+        PADLIST *derived = execstate_derive_padlist(cv);
+        RETVAL = derived != NULL
+              && derived != orig
+              && PadlistNAMES(derived) == PadlistNAMES(orig)
+              && PadlistMAX(derived) == 1
+              && PadlistARRAY(derived)[1] != NULL;
+        execstate_free_padlist(derived);
+    }
+    OUTPUT:
+        RETVAL
+
+# Level 4 (transfer registers): topenv/restartop are lvalue aliases of the JMPENV
+# state; topenv_root walks je_prev to the base handler; topenv_reset points at the
+# interpreter base.  Everything is saved and restored so the caller is undisturbed.
+IV
+jmpenv_ok()
+    CODE:
+    {
+        JMPENV *saved_te  = PL_top_env;
+        OP     *saved_rop = PL_restartop;
+        JMPENV *root = execstate_topenv_root();
+        JMPENV *walk = PL_top_env;
+        int ok = 1;
+
+        while (walk->je_prev)
+            walk = walk->je_prev;
+        ok = ok && root != NULL && root == walk;   /* topenv_root == je_prev root */
+        ok = ok && execstate_topenv == PL_top_env; /* topenv aliases PL_top_env   */
+
+        execstate_restartop = saved_rop;           /* restartop is a writable alias */
+        ok = ok && execstate_restartop == PL_restartop;
+
+        execstate_topenv_reset();                  /* -> interpreter base ...       */
+        ok = ok && PL_top_env == &PL_start_env;
+        PL_top_env = saved_te;                     /* ... then restore              */
+
+        RETVAL = ok;
+    }
+    OUTPUT:
+        RETVAL
+
 MODULE = XS::APItest            PACKAGE = XS::APItest::vstring
 
 bool

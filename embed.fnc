@@ -1158,6 +1158,17 @@ AOdp	|SV *	|eval_pv	|NN const char *p			\
 				|I32 croak_on_error
 AOdp	|SSize_t|eval_sv	|NN SV *sv				\
 				|I32 flags
+: interpreter execution-state API ("execstate") - see Porting/execstate_api.md
+Adp	|PADLIST *|execstate_derive_padlist				\
+				|NN CV *cv
+Adp	|void	|execstate_destroy
+Adp	|void	|execstate_free_padlist 				\
+				|NN PADLIST *padlist
+Adp	|void	|execstate_init |int cxextra
+Adp	|void	|execstate_load |NN PerlExecState *from
+Adp	|void	|execstate_save |NN PerlExecState *into
+Adp	|JMPENV *|execstate_topenv_root
+Adp	|void	|execstate_unwind
 ATdmp	|bool	|extended_utf8_to_uv					\
 				|NN const U8 * const s			\
 				|NN const U8 * const e			\
