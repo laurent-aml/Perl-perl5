@@ -59,6 +59,65 @@ typedef PerlIO * InputStream;
 typedef PerlIO * OutputStream;
 
 #define croak_fail() croak("fail at " __FILE__ " line %d", __LINE__)
+
+/* Callback for savestack_frozen_foreach_sv(): counts the SVs a frozen blob
+ * retains (used by XS::APItest::savestack::test_suspend_scalar). */
+static void
+apitest_count_frozen_sv(pTHX_ SV *sv, const char *desc, void *ud)
+{
+    PERL_UNUSED_ARG(sv);
+    PERL_UNUSED_ARG(desc);
+    ++*(IV *)ud;
+}
+
+/* Helpers for the array/hash savestack suspend tests: (re)fill a container from
+ * a Perl ref, and read a marker element that distinguishes outer from inner. */
+static void
+apitest_av_fill(pTHX_ AV *dst, SV *ref)
+{
+    AV *src = (AV *)SvRV(ref);
+    SSize_t i, n = av_count(src);
+    av_clear(dst);
+    for (i = 0; i < n; i++) {
+        SV **e = av_fetch(src, i, 0);
+        av_push(dst, newSVsv(e ? *e : &PL_sv_undef));
+    }
+}
+
+static SV *
+apitest_av_marker(pTHX_ AV *av)
+{
+    SV **e = av_fetch(av, 0, 0);
+    return newSVsv(e ? *e : &PL_sv_undef);
+}
+
+static void
+apitest_hv_fill(pTHX_ HV *dst, SV *ref)
+{
+    HV *src = (HV *)SvRV(ref);
+    HE *he;
+    hv_clear(dst);
+    hv_iterinit(src);
+    while ((he = hv_iternext(src)))
+        (void)hv_store_ent(dst, hv_iterkeysv(he), newSVsv(hv_iterval(src, he)), 0);
+}
+
+static SV *
+apitest_hv_marker(pTHX_ HV *hv)
+{
+    SV **e = hv_fetchs(hv, "k", 0);
+    return newSVsv(e ? *e : &PL_sv_undef);
+}
+
+/* Counter + destructor for the SAVEt_DESTRUCTOR_X suspend test. */
+static int apitest_dtor_calls;
+static void
+apitest_dtorx(pTHX_ void *p)
+{
+    PERL_UNUSED_ARG(p);
+    apitest_dtor_calls++;
+}
+
 #define croak_fail_nep(h, w) croak("fail %p!=%p at " __FILE__ " line %d", (h), (w), __LINE__)
 #define croak_fail_nei(h, w) croak("fail %d!=%d at " __FILE__ " line %d", (int)(h), (int)(w), __LINE__)
 
@@ -8450,6 +8509,907 @@ get_savestack_ix()
         RETVAL = PL_savestack_ix;
     OUTPUT:
         RETVAL
+
+void
+test_suspend_scalar(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* Self-contained freeze/thaw (or freeze/frozen_free when `cancel`)
+         * round-trip for a package-scalar `local`, so the save-stack contents
+         * between base and freeze are known to be exactly one SAVEt_SV.
+         * Returns the probe's value observed at each checkpoint plus two ints:
+         *   (during, after_freeze, freeze_ix_delta, after_op, after_leave, nsv)
+         * after_op is post-thaw (or post-free); nsv is the SV count reported by
+         * frozen_foreach_sv at freeze time. */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe", GV_ADD, SVt_PV);
+        SV **svp;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        svp = &GvSVn(gv);
+        sv_setsv(*svp, outer);          /* outer (pre-local) value */
+        base = PL_savestack_ix;
+        save_scalar(gv);                /* local $probe */
+        sv_setsv(*svp, inner);          /* localized value */
+        during = newSVsv(*svp);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = newSVsv(*svp);
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = newSVsv(*svp);
+
+        if (PL_savestack_ix > base)     /* thaw re-pushed the local; unwind it */
+            leave_scope(base);
+        after_leave = newSVsv(*svp);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_comppad(bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_COMPPAD round-trip against a self-owned localized pad.  Returns
+         * booleans comparing PL_comppad at each checkpoint, plus the freeze
+         * delta and the frozen SV count:
+         *   (during_localized, after_freeze_outer, delta, after_op, after_leave_outer, nsv)
+         */
+        PAD *outer_comppad = PL_comppad;
+        SV **outer_curpad  = PL_curpad;
+        AV  *localized = newAV();
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        IV during_ok, after_freeze_ok, after_op_ok, after_leave_ok;
+
+        base = PL_savestack_ix;
+        SAVECOMPPAD();                       /* SAVEt_COMPPAD saving outer */
+        PL_comppad = (PAD *)localized;
+        PL_curpad  = AvARRAY(localized);
+        during_ok  = (PL_comppad == (PAD *)localized);
+
+        frozen          = savestack_freeze(base);
+        freeze_delta    = PL_savestack_ix - base;
+        after_freeze_ok = (PL_comppad == outer_comppad);   /* reverted to outer */
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op_ok = cancel ? (PL_comppad == outer_comppad)
+                             : (PL_comppad == (PAD *)localized);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave_ok = (PL_comppad == outer_comppad);
+
+        PL_comppad = outer_comppad;          /* guarantee sane globals */
+        PL_curpad  = outer_curpad;
+        SvREFCNT_dec((SV *)localized);
+
+        EXTEND(SP, 6);
+        mPUSHi(during_ok);
+        mPUSHi(after_freeze_ok);
+        mPUSHi(freeze_delta);
+        mPUSHi(after_op_ok);
+        mPUSHi(after_leave_ok);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_clearsv(bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_CLEARSV round-trip: a self-owned pad with a lexical SV in slot
+         * 1.  freeze must not clear it; a real leave_scope after thaw clears it
+         * (in place); a cancelled suspension drops the clear entirely.  Returns:
+         *   (alive_during, alive_after_freeze, delta, alive_after_op,
+         *    cleared_after_leave, nsv)
+         */
+        PAD *save_comppad = PL_comppad;
+        SV **save_curpad  = PL_curpad;
+        AV  *pad = newAV();
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        IV alive_during, alive_after_freeze, alive_after_op, cleared_after_leave;
+
+        av_extend(pad, 1);
+        av_store(pad, 1, newSVpvs("LEXVALUE"));    /* slot 1 owns the lexical */
+        PL_comppad = (PAD *)pad;
+        PL_curpad  = AvARRAY(pad);
+
+        base = PL_savestack_ix;
+        save_clearsv(&PL_curpad[1]);               /* SAVEt_CLEARSV for slot 1 */
+        alive_during = cBOOL(SvPOK(PL_curpad[1]));
+
+        frozen             = savestack_freeze(base);
+        freeze_delta       = PL_savestack_ix - base;
+        alive_after_freeze = cBOOL(SvPOK(PL_curpad[1]));   /* not cleared by freeze */
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        alive_after_op = cBOOL(SvPOK(PL_curpad[1]));
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);                     /* thawed: runs the clear */
+        cleared_after_leave = cBOOL(!SvOK(PL_curpad[1]));
+
+        PL_comppad = save_comppad;
+        PL_curpad  = save_curpad;
+        SvREFCNT_dec((SV *)pad);                   /* frees the (cleared) lexical */
+
+        EXTEND(SP, 6);
+        mPUSHi(alive_during);
+        mPUSHi(alive_after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHi(alive_after_op);
+        mPUSHi(cleared_after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_clearpadrange(bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_CLEARPADRANGE round-trip: two lexicals in slots 1..2, cleared as
+         * a range.  Same handler as CLEARSV; this exercises the count>1 payload
+         * and the range clear at leave_scope.  Returns:
+         *   (alive_during, alive_after_freeze, delta, alive_after_op,
+         *    both_cleared_after_leave, nsv)
+         */
+        PAD *save_comppad = PL_comppad;
+        SV **save_curpad  = PL_curpad;
+        AV  *pad = newAV();
+        UV payload;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        IV alive_during, alive_after_freeze, alive_after_op, both_cleared;
+
+        av_extend(pad, 2);
+        av_store(pad, 1, newSVpvs("LEX1"));
+        av_store(pad, 2, newSVpvs("LEX2"));
+        PL_comppad = (PAD *)pad;
+        PL_curpad  = AvARRAY(pad);
+
+        base = PL_savestack_ix;
+        /* push a SAVEt_CLEARPADRANGE for base offset 1, count 2 (as the op does) */
+        payload = ((UV)1 << (OPpPADRANGE_COUNTSHIFT + SAVE_TIGHT_SHIFT))
+                | ((UV)2 << SAVE_TIGHT_SHIFT)
+                | SAVEt_CLEARPADRANGE;
+        {
+            dSS_ADD;
+            SS_ADD_UV(payload);
+            SS_ADD_END(1);
+        }
+        alive_during = cBOOL(SvPOK(PL_curpad[1]) && SvPOK(PL_curpad[2]));
+
+        frozen             = savestack_freeze(base);
+        freeze_delta       = PL_savestack_ix - base;
+        alive_after_freeze = cBOOL(SvPOK(PL_curpad[1]) && SvPOK(PL_curpad[2]));
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        alive_after_op = cBOOL(SvPOK(PL_curpad[1]) && SvPOK(PL_curpad[2]));
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        both_cleared = cBOOL(!SvOK(PL_curpad[1]) && !SvOK(PL_curpad[2]));
+
+        PL_comppad = save_comppad;
+        PL_curpad  = save_curpad;
+        SvREFCNT_dec((SV *)pad);
+
+        EXTEND(SP, 6);
+        mPUSHi(alive_during);
+        mPUSHi(alive_after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHi(alive_after_op);
+        mPUSHi(both_cleared);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_padsv(bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_PADSV_AND_MORTALIZE round-trip: slot 1 of a self-owned pad holds
+         * "OUTER"; save_padsv_and_mortalize saves it, then we install "LOCAL".
+         * Returns the slot's string value at each checkpoint plus delta/nsv:
+         *   (during, after_freeze, delta, after_op, after_leave, nsv)
+         */
+        PAD *save_comppad = PL_comppad;
+        SV **save_curpad  = PL_curpad;
+        AV  *pad = newAV();
+        SV  *localized;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        av_extend(pad, 1);
+        av_store(pad, 1, newSVpvs("OUTER"));       /* slot 1 owns the outer SV */
+        PL_comppad = (PAD *)pad;
+        PL_curpad  = AvARRAY(pad);
+
+        base = PL_savestack_ix;
+        save_padsv_and_mortalize(1);               /* saves an inc'd ref to OUTER */
+        localized = newSVpvs("LOCAL");
+        SvREFCNT_dec(PL_curpad[1]);                /* drop slot's outer ref (save kept its own) */
+        PL_curpad[1] = localized;                  /* slot owns the localized SV  */
+        during = newSVsv(PL_curpad[1]);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = newSVsv(PL_curpad[1]);      /* reverted to OUTER */
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = newSVsv(PL_curpad[1]);          /* thaw: LOCAL, cancel: OUTER */
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);                     /* restores OUTER, mortalizes LOCAL */
+        after_leave = newSVsv(PL_curpad[1]);
+
+        PL_comppad = save_comppad;
+        PL_curpad  = save_curpad;
+        SvREFCNT_dec((SV *)pad);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_av(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* As test_suspend_scalar but for `local @array` (one SAVEt_AV).  outer
+         * and inner are array refs; the reported values are element 0. */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_av", GV_ADD, SVt_PVAV);
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        apitest_av_fill(aTHX_ GvAVn(gv), outer);
+        base = PL_savestack_ix;
+        save_ary(gv);                           /* local @probe_av */
+        apitest_av_fill(aTHX_ GvAV(gv), inner);
+        during = apitest_av_marker(aTHX_ GvAV(gv));
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = apitest_av_marker(aTHX_ GvAV(gv));
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = apitest_av_marker(aTHX_ GvAV(gv));
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = apitest_av_marker(aTHX_ GvAV(gv));
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_hv(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* As test_suspend_av but for `local %hash` (one SAVEt_HV).  outer and
+         * inner are hash refs; the reported values are $h{k}. */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_hv", GV_ADD, SVt_PVHV);
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        apitest_hv_fill(aTHX_ GvHVn(gv), outer);
+        base = PL_savestack_ix;
+        save_hash(gv);                          /* local %probe_hv */
+        apitest_hv_fill(aTHX_ GvHV(gv), inner);
+        during = apitest_hv_marker(aTHX_ GvHV(gv));
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = apitest_hv_marker(aTHX_ GvHV(gv));
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = apitest_hv_marker(aTHX_ GvHV(gv));
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = apitest_hv_marker(aTHX_ GvHV(gv));
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_helem(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* `local $h{k}` (one SAVEt_HELEM).  outer/inner are plain scalars; the
+         * reported values are $h{k} re-fetched at each checkpoint. */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_helem", GV_ADD, SVt_PVHV);
+        HV *hv = GvHVn(gv);
+        SV *keysv = sv_2mortal(newSVpvs("k"));
+        HE *he;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        (void)hv_store_ent(hv, keysv, newSVsv(outer), 0);   /* $h{k} = outer */
+        base = PL_savestack_ix;
+        he = hv_fetch_ent(hv, keysv, 1, 0);
+        save_helem_flags(hv, keysv, &HeVAL(he), SAVEf_SETMAGIC);
+        sv_setsv(HeVAL(he), inner);                         /* localized value */
+        during = apitest_hv_marker(aTHX_ hv);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = apitest_hv_marker(aTHX_ hv);
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = apitest_hv_marker(aTHX_ hv);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = apitest_hv_marker(aTHX_ hv);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_aelem(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* `local $a[0]` (one SAVEt_AELEM).  outer/inner are plain scalars; the
+         * reported values are $a[0] re-fetched at each checkpoint. */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_aelem", GV_ADD, SVt_PVAV);
+        AV *av = GvAVn(gv);
+        SV **sptr;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        av_store(av, 0, newSVsv(outer));                    /* $a[0] = outer */
+        base = PL_savestack_ix;
+        sptr = av_fetch(av, 0, 1);
+        save_aelem_flags(av, 0, sptr, SAVEf_SETMAGIC);
+        sv_setsv(*sptr, inner);                             /* localized value */
+        during = apitest_av_marker(aTHX_ av);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = apitest_av_marker(aTHX_ av);
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = apitest_av_marker(aTHX_ av);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = apitest_av_marker(aTHX_ av);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_hdelete(SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* `local $h{new_key} = inner` where new_key did not exist, i.e. a
+         * SAVEt_DELETE (restore-to-absent).  Reports: (during_val, af_exists,
+         * delta, after_op_val, al_exists, nsv).  after_op_val is the re-created
+         * value on the thaw path, or "" (absent) on the cancel path. */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_hdelete", GV_ADD, SVt_PVHV);
+        HV *hv = GvHVn(gv);
+        SV *keysv = sv_2mortal(newSVpvs("nk"));
+        SV **e;
+        IV base, freeze_delta, nsv = 0, af_exists, al_exists;
+        PerlSavestackFrozen *frozen;
+        SV *during_val, *after_op_val;
+
+        (void)hv_delete_ent(hv, keysv, G_DISCARD, 0);   /* ensure absent */
+        base = PL_savestack_ix;
+        save_hdelete(hv, keysv);                        /* delete-on-exit */
+        (void)hv_store_ent(hv, keysv, newSVsv(inner), 0); /* create localized elem */
+        e = hv_fetchs(hv, "nk", 0);
+        during_val = newSVsv(e ? *e : &PL_sv_undef);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        af_exists    = hv_exists(hv, "nk", 2) ? 1 : 0;
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        e = hv_fetchs(hv, "nk", 0);
+        after_op_val = newSVsv(e ? *e : &PL_sv_undef);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        al_exists = hv_exists(hv, "nk", 2) ? 1 : 0;
+
+        EXTEND(SP, 6);
+        mPUSHs(during_val);
+        mPUSHi(af_exists);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op_val);
+        mPUSHi(al_exists);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_adelete(SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* `local $a[0] = inner` where index 0 did not exist (SAVEt_ADELETE). */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_adelete", GV_ADD, SVt_PVAV);
+        AV *av = GvAVn(gv);
+        SV **e;
+        IV base, freeze_delta, nsv = 0, af_exists, al_exists;
+        PerlSavestackFrozen *frozen;
+        SV *during_val, *after_op_val;
+
+        if (av_exists(av, 0))
+            (void)av_delete(av, 0, G_DISCARD);          /* ensure absent */
+        base = PL_savestack_ix;
+        save_adelete(av, 0);                            /* delete-on-exit */
+        av_store(av, 0, newSVsv(inner));               /* create localized elem */
+        e = av_fetch(av, 0, 0);
+        during_val = newSVsv(e ? *e : &PL_sv_undef);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        af_exists    = av_exists(av, 0) ? 1 : 0;
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        e = av_fetch(av, 0, 0);
+        after_op_val = newSVsv(e ? *e : &PL_sv_undef);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        al_exists = av_exists(av, 0) ? 1 : 0;
+
+        EXTEND(SP, 6);
+        mPUSHs(during_val);
+        mPUSHi(af_exists);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op_val);
+        mPUSHi(al_exists);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_svp(int is_generic, SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_GVSV (is_generic=0) or SAVEt_GENERIC_SVREF (is_generic=1),
+         * both localizing a GV scalar slot via leave_scope's restore_svp.  The
+         * setup mirrors S_localise_gv_slot / save_generic_svref: save (which
+         * inc's the outer value), then replace the slot without dec'ing the
+         * outer (its ref is parked for restore). */
+        GV *gv = gv_fetchpvs("XS::APItest::savestack::probe_svp", GV_ADD, SVt_PV);
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        sv_setsv(GvSVn(gv), outer);
+        base = PL_savestack_ix;
+        if (is_generic)
+            save_generic_svref(&GvSV(gv));
+        else
+            save_pushptrptr(gv, SvREFCNT_inc_simple(GvSV(gv)), SAVEt_GVSV);
+        GvSV(gv) = newSVsv(inner);      /* localized; outer ref parked */
+        during = newSVsv(GvSV(gv));
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = newSVsv(GvSV(gv));
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = newSVsv(GvSV(gv));
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = newSVsv(GvSV(gv));
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_cint(int kind, IV outer, IV inner, bool cancel)
+    PPCODE:
+    {
+        /* Localize a C scalar of the selected width (0=int 1=IV 2=I32 3=I16
+         * 4=I8 5=bool 6=STRLEN) and round-trip it.  Returns the probe value at
+         * each checkpoint plus the frozen_foreach_sv count (always 0). */
+        static int    probe_int;
+        static IV     probe_iv;
+        static I32    probe_i32;
+        static I16    probe_i16;
+        static I8     probe_i8;
+        static bool   probe_bool;
+        static STRLEN probe_strlen;
+        IV base, delta, during, af, ao, al, nsv = 0;
+        PerlSavestackFrozen *frozen;
+
+        switch (kind) {
+        case 0: probe_int    = (int)outer;    break;
+        case 1: probe_iv     = outer;         break;
+        case 2: probe_i32    = (I32)outer;    break;
+        case 3: probe_i16    = (I16)outer;    break;
+        case 4: probe_i8     = (I8)outer;     break;
+        case 5: probe_bool   = cBOOL(outer);  break;
+        case 6: probe_strlen = (STRLEN)outer; break;
+        }
+        base = PL_savestack_ix;
+        switch (kind) {
+        case 0: save_int(&probe_int);        probe_int    = (int)inner;    break;
+        case 1: save_iv(&probe_iv);          probe_iv     = inner;         break;
+        case 2: save_I32(&probe_i32);        probe_i32    = (I32)inner;    break;
+        case 3: save_I16(&probe_i16);        probe_i16    = (I16)inner;    break;
+        case 4: save_I8(&probe_i8);          probe_i8     = (I8)inner;     break;
+        case 5: save_bool(&probe_bool);      probe_bool   = cBOOL(inner);  break;
+        /* save_strlen has no XS short-name macro (Xp, not API), so call the
+         * Perl_-prefixed function directly. */
+        case 6: Perl_save_strlen(aTHX_ &probe_strlen);
+                probe_strlen = (STRLEN)inner; break;
+        }
+#define CINT_READ (kind==0 ? (IV)probe_int : kind==1 ? probe_iv :        \
+                   kind==2 ? (IV)probe_i32 : kind==3 ? (IV)probe_i16 :   \
+                   kind==4 ? (IV)probe_i8  : kind==5 ? (IV)probe_bool :  \
+                   (IV)probe_strlen)
+        during = CINT_READ;
+        frozen = savestack_freeze(base);
+        delta  = PL_savestack_ix - base;
+        af     = CINT_READ;
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        ao = CINT_READ;
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        al = CINT_READ;
+#undef CINT_READ
+
+        EXTEND(SP, 6);
+        mPUSHi(during);
+        mPUSHi(af);
+        mPUSHi(delta);
+        mPUSHi(ao);
+        mPUSHi(al);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_sptr(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_SPTR: a non-refcounted SV* slot.  Persistent probe SVs so the
+         * slot never dangles across the (no-refcount) round-trip. */
+        static SV *o = NULL, *i = NULL, *slot;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        if (!o) { o = newSV(0); i = newSV(0); }
+        sv_setsv(o, outer);
+        sv_setsv(i, inner);
+        slot = o;
+        base = PL_savestack_ix;
+        save_sptr(&slot);               /* (outer=o, &slot) */
+        slot = i;                       /* localized pointer */
+        during = newSVsv(slot);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = newSVsv(slot);
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = newSVsv(slot);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = newSVsv(slot);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_item(SV *outer, SV *inner, bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_ITEM: localize an SV's value in place (save_item / sv_replace). */
+        static SV *item = NULL;
+        IV base, freeze_delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        if (!item) item = newSV(0);
+        sv_setsv(item, outer);
+        base = PL_savestack_ix;
+        save_item(item);
+        sv_setsv(item, inner);          /* localized value, in place */
+        during = newSVsv(item);
+
+        frozen       = savestack_freeze(base);
+        freeze_delta = PL_savestack_ix - base;
+        after_freeze = newSVsv(item);
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = newSVsv(item);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = newSVsv(item);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(freeze_delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_destructor_x(int mode)
+    PPCODE:
+    {
+        /* Deferred *user callback* semantics for SAVEt_DESTRUCTOR_X.  freeze
+         * never runs it.  mode 0 (thaw): leave_scope runs it.  mode 1 (cancel):
+         * savestack_frozen_run_deferred runs it, and the following frozen_free
+         * must NOT run it again.  mode 2 (plain discard): frozen_free alone must
+         * NOT run it.  Returns (delta, at_freeze, at_mid, at_end, nsv), where
+         * at_mid is measured after the thaw/run_deferred step. */
+        IV base, delta, at_freeze, at_mid, at_end, nsv = 0;
+        PerlSavestackFrozen *frozen;
+
+        apitest_dtor_calls = 0;
+        base = PL_savestack_ix;
+        SAVEDESTRUCTOR_X(apitest_dtorx, (void *)NULL);
+
+        frozen    = savestack_freeze(base);
+        delta     = PL_savestack_ix - base;
+        at_freeze = apitest_dtor_calls;             /* 0: freeze never runs it */
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        switch (mode) {
+          case 0:  savestack_thaw(frozen);                break; /* re-register */
+          case 1:  savestack_frozen_run_deferred(frozen); break; /* cancel: run */
+          default: /* mode 2: plain discard, no run_deferred */  break;
+        }
+        at_mid = apitest_dtor_calls;    /* thaw:0  run_deferred:1  discard:0 */
+
+        if (mode != 0)
+            savestack_frozen_free(frozen);          /* must NOT run the callback */
+        if (PL_savestack_ix > base)
+            leave_scope(base);                      /* thaw path: runs it here */
+        at_end = apitest_dtor_calls;    /* thaw:1  cancel:1  discard:0 */
+
+        EXTEND(SP, 5);
+        mPUSHi(delta);
+        mPUSHi(at_freeze);
+        mPUSHi(at_mid);
+        mPUSHi(at_end);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_setflags(bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_SET_SVFLAGS: a deferred action that clears SVf_IOK at scope
+         * exit.  Reports SvIOK at each checkpoint (freeze must not apply it). */
+        SV *sv = sv_2mortal(newSViv(5));            /* SVf_IOK set */
+        IV base, delta, iok_freeze, iok_op, iok_leave, nsv = 0;
+        PerlSavestackFrozen *frozen;
+
+        base = PL_savestack_ix;
+        save_set_svflags(sv, SVf_IOK, 0);           /* at exit: clear IOK */
+
+        frozen     = savestack_freeze(base);
+        delta      = PL_savestack_ix - base;
+        iok_freeze = SvIOK(sv) ? 1 : 0;             /* 1: not applied by freeze */
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        iok_op = SvIOK(sv) ? 1 : 0;
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        iok_leave = SvIOK(sv) ? 1 : 0;
+
+        EXTEND(SP, 5);
+        mPUSHi(delta);
+        mPUSHi(iok_freeze);
+        mPUSHi(iok_op);
+        mPUSHi(iok_leave);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_freesv(bool cancel)
+    PPCODE:
+    {
+        /* SAVEt_FREESV: freeze retains the SV (does not free it); thaw+leave or
+         * frozen_free frees it exactly once (checked for leaks by the caller).
+         * Returns (delta, refcnt_after_freeze, nsv). */
+        SV *sv = newSV(0);                          /* refcnt 1, owned by save */
+        IV base, delta, rc_after_freeze, nsv = 0;
+        PerlSavestackFrozen *frozen;
+
+        base = PL_savestack_ix;
+        SAVEFREESV(sv);
+
+        frozen          = savestack_freeze(base);
+        delta           = PL_savestack_ix - base;
+        rc_after_freeze = SvREFCNT(sv);             /* 1: retained, not freed */
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);          /* frees sv */
+        else
+            savestack_thaw(frozen);
+        if (PL_savestack_ix > base)
+            leave_scope(base);                      /* thaw path: frees sv */
+
+        EXTEND(SP, 3);
+        mPUSHi(delta);
+        mPUSHi(rc_after_freeze);
+        mPUSHi(nsv);
+    }
+
+void
+test_suspend_pvref(int kind, bool cancel)
+    PPCODE:
+    {
+        /* Localize a char* slot: 0 = SAVEt_GENERIC_PVREF (Safefree),
+         * 1 = SAVEt_SHARED_PVREF (PerlMemShared_free), 2 = SAVEt_RCPV
+         * (ref-counted).  Reports the slot's string at each checkpoint. */
+        static char *p_gen = NULL, *p_shr = NULL, *p_rc = NULL;
+        char **slot;
+        IV base, delta, nsv = 0;
+        PerlSavestackFrozen *frozen;
+        SV *during, *after_freeze, *after_op, *after_leave;
+
+        switch (kind) {
+        case 0: Safefree(p_gen);            p_gen = savepv("OUTER");
+                slot = &p_gen; break;
+        case 1: if (p_shr) PerlMemShared_free(p_shr); p_shr = savesharedpv("OUTER");
+                slot = &p_shr; break;
+        default: if (p_rc) rcpv_free(p_rc); p_rc = rcpv_new("OUTER", 5, 0);
+                slot = &p_rc; break;
+        }
+        base = PL_savestack_ix;
+        switch (kind) {
+        case 0: save_generic_pvref(slot); *slot = savepv("INNER");          break;
+        case 1: save_shared_pvref(slot);  *slot = savesharedpv("INNER");    break;
+        default: save_rcpv(slot);         *slot = rcpv_new("INNER", 5, 0);  break;
+        }
+        during = newSVpv(*slot, 0);
+
+        frozen       = savestack_freeze(base);
+        delta        = PL_savestack_ix - base;
+        after_freeze = newSVpv(*slot, 0);
+        savestack_frozen_foreach_sv(frozen, apitest_count_frozen_sv, &nsv);
+
+        if (cancel)
+            savestack_frozen_free(frozen);
+        else
+            savestack_thaw(frozen);
+        after_op = newSVpv(*slot, 0);
+
+        if (PL_savestack_ix > base)
+            leave_scope(base);
+        after_leave = newSVpv(*slot, 0);
+
+        EXTEND(SP, 6);
+        mPUSHs(during);
+        mPUSHs(after_freeze);
+        mPUSHi(delta);
+        mPUSHs(after_op);
+        mPUSHs(after_leave);
+        mPUSHi(nsv);
+    }
 
 MODULE = XS::APItest            PACKAGE = XS::APItest::execstate
 

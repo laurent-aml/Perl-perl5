@@ -3010,9 +3010,21 @@ Cdp	|void	|save_shared_pvref					\
 				|NN char **str
 Aadip	|char * |savesharedsvpv |NN SV *sv
 Cp	|void	|save_sptr	|NN SV **sptr
+: savestack suspend/resume API ("parkapi") - see Porting/savestack_suspend_api.md
+Adp	|PerlSavestackFrozen *|savestack_freeze 			\
+				|I32 base_ix
+Adp	|void	|savestack_frozen_foreach_sv				\
+				|NULLOK PerlSavestackFrozen *frozen	\
+				|NN PerlSavestackFrozenSVCb cb		\
+				|NULLOK void *ud
+Adp	|void	|savestack_frozen_free					\
+				|NULLOK PerlSavestackFrozen *frozen
+Adp	|void	|savestack_frozen_run_deferred				\
+				|NULLOK PerlSavestackFrozen *frozen
 Cp	|void	|savestack_grow
 Cp	|void	|savestack_grow_cnt					\
 				|I32 need
+Adp	|void	|savestack_thaw |NULLOK PerlSavestackFrozen *frozen
 Xp	|void	|save_strlen	|NN STRLEN *ptr
 Aadip	|char * |savesvpv	|NN SV *sv
 Adhp	|SV *	|save_svref	|NN SV **sptr
