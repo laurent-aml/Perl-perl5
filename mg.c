@@ -862,6 +862,17 @@ Perl_sv_string_from_errnum(pTHX_ int errnum, SV *tgtsv)
 
     if(!tgtsv)
         tgtsv = newSV_type_mortal(SVt_PV);
+
+    /* my_strerror() generates the message into savestack-lifetime scratch (it
+     * uses SAVEFREEPV, and the locale machinery may push more): entries that
+     * would otherwise linger in the caller's dynamic scope until it exits. We
+     * only need the string long enough to copy it into tgtsv, so contain that
+     * scratch in its own scope. Besides freeing it promptly, this keeps the
+     * savestack clean on return, which lets mg_get()'s restore_magic pop its
+     * MGS immediately rather than deferring it to scope exit - the deferral is
+     * what left un-relocatable savestack entries behind and made reading a
+     * non-zero $!/$^E before a Future::AsyncAwait await panic on suspend. */
+    ENTER;
     errstr = my_strerror(errnum, &utf8ness);
     if(errstr) {
         sv_setpv(tgtsv, errstr);
@@ -872,6 +883,8 @@ Perl_sv_string_from_errnum(pTHX_ int errnum, SV *tgtsv)
     } else {
         SvPVCLEAR(tgtsv);
     }
+    LEAVE;
+
     return tgtsv;
 }
 
