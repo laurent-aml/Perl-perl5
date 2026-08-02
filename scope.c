@@ -1745,6 +1745,269 @@ Perl_leave_scope(pTHX_ I32 base)
     TAINT_set(was);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Interpreter execution-state API ("execstate") - see execstate.h and
+ * Porting/execstate_api.md.  A green-thread execution state is the generic
+ * mutable execution registers (the value/mark/scope/save/tmps stacks, the
+ * execution position, the compile cursors and the flags), listed once as the
+ * PERL_EXECSTATE_SLOTS X-macro in execstate.h.  save/load copy them to/from the
+ * live interpreter; the caller does its own C-stack switch between a save and a
+ * load, and handles any per-thread policy globals itself.
+ *
+ * Register list derived from Coro/state.h by Marc A. Lehmann; see execstate.h.
+ * ------------------------------------------------------------------------- */
+
+/*
+=for apidoc_section $callback
+=for apidoc execstate_save
+
+Snapshot the live interpreter's generic execution registers (the value / mark /
+scope / save / temporaries stacks, the execution position, the compile-time
+cursors and the execution flags) into C<into>.  With
+L</C<execstate_load>> this lets a stackful coroutine library swap execution
+states: S<C<execstate_save(a); ... ; execstate_load(b)>>, doing its own C-stack
+switch in between.  It does not touch per-thread policy globals (C<$_>, C<$@>,
+C<$/>, ...) - those are the caller's to manage.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_execstate_save(pTHX_ PerlExecState *into)
+{
+    PERL_ARGS_ASSERT_EXECSTATE_SAVE;
+#define PERL_EXECSTATE_SAVE(name, lval, type) into->name = lval;
+    PERL_EXECSTATE_SLOTS(PERL_EXECSTATE_SAVE)
+#undef PERL_EXECSTATE_SAVE
+}
+
+/*
+=for apidoc execstate_load
+
+Install a state previously captured by L</C<execstate_save>> as the live
+interpreter's generic execution registers.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_execstate_load(pTHX_ PerlExecState *from)
+{
+    PERL_ARGS_ASSERT_EXECSTATE_LOAD;
+#define PERL_EXECSTATE_LOAD(name, lval, type) lval = from->name;
+    PERL_EXECSTATE_SLOTS(PERL_EXECSTATE_LOAD)
+#undef PERL_EXECSTATE_LOAD
+}
+
+/*
+=for apidoc execstate_init
+
+Allocate a fresh set of interpreter stacks for a new execution context and make
+them live, reserving C<cxextra> extra context-stack entries for the caller to
+overlay its own per-thread storage on.  Undone by L</C<execstate_destroy>>.  The
+initial sizes are modest, on the assumption that a green thread does not usually
+need much stack.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_execstate_init(pTHX_ int cxextra)
+{
+    PL_curstackinfo = new_stackinfo(32, 4 + cxextra);
+    PL_curstackinfo->si_type = PERLSI_MAIN;
+    PL_curstack = PL_curstackinfo->si_stack;
+    PL_mainstack = PL_curstack;		/* remember in case we switch stacks */
+
+    PL_stack_base = AvARRAY(PL_curstack);
+    PL_stack_sp = PL_stack_base;
+    PL_stack_max = PL_stack_base + AvMAX(PL_curstack);
+
+    Newx(PL_tmps_stack, 32, SV*);
+    PL_tmps_floor = -1;
+    PL_tmps_ix = -1;
+    PL_tmps_max = 32;
+
+    Newx(PL_markstack, 16, Stack_off_t);
+    PL_markstack_ptr = PL_markstack;
+    PL_markstack_max = PL_markstack + 16;
+
+    SET_MARK_OFFSET;
+
+    Newx(PL_scopestack, 8, I32);
+    PL_scopestack_ix = 0;
+    PL_scopestack_max = 8;
+#ifdef DEBUGGING
+    Newx(PL_scopestack_name, 8, const char*);
+#endif
+
+    Newx(PL_savestack, 24, ANY);
+    PL_savestack_ix = 0;
+    /* PL_savestack_max always carries SS_MAXPUSH of slack over what it claims */
+    PL_savestack_max = 24 - SS_MAXPUSH;
+}
+
+/*
+=for apidoc execstate_unwind
+
+Unwind the live execution context - pop the context stack, leave all remaining
+scopes and free the temporaries - as when a green thread is discarded.  The
+order matters: C<dounwind> must run before the blanket C<LEAVE_SCOPE(0)>, so each
+frame's save-stack entries are processed against that frame's pad; doing
+C<LEAVE_SCOPE> first leaves an outer frame's pad slot stale and corrupts
+refcounts in C<leave_scope>.  A no-op during global destruction.
+B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_execstate_unwind(pTHX)
+{
+    if (PL_phase != PERL_PHASE_DESTRUCT) {
+        POPSTACK_TO(PL_mainstack);
+        dounwind(-1);
+        LEAVE_SCOPE(0);
+        assert(PL_tmps_floor == -1);
+        FREETMPS;
+        assert(PL_tmps_ix == -1);
+    }
+}
+
+/*
+=for apidoc execstate_destroy
+
+Free the interpreter stacks and the context-stack chain of an execution context
+allocated by L</C<execstate_init>>.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_execstate_destroy(pTHX)
+{
+    while (PL_curstackinfo->si_next)
+        PL_curstackinfo = PL_curstackinfo->si_next;
+
+    while (PL_curstackinfo) {
+        PERL_SI *p = PL_curstackinfo->si_prev;
+
+        if (PL_phase != PERL_PHASE_DESTRUCT)
+            SvREFCNT_dec(PL_curstackinfo->si_stack);
+
+        Safefree(PL_curstackinfo->si_cxstack);
+        Safefree(PL_curstackinfo);
+        PL_curstackinfo = p;
+    }
+
+    Safefree(PL_tmps_stack);
+    Safefree(PL_markstack);
+    Safefree(PL_scopestack);
+#ifdef DEBUGGING
+    Safefree(PL_scopestack_name);
+#endif
+    Safefree(PL_savestack);
+}
+
+/*
+=for apidoc execstate_derive_padlist
+
+Derive a fresh padlist for C<cv> so it may be re-entered on an independent
+execution context (recursion across green threads).  Free the result with
+L</C<execstate_free_padlist>>.  B<Experimental.>
+
+=cut
+*/
+
+PADLIST *
+Perl_execstate_derive_padlist(pTHX_ CV *cv)
+{
+    PADLIST *padlist = CvPADLIST(cv);
+    PADLIST *newpadlist;
+    PADNAMELIST *padnames;
+    PAD *newpad;
+    PADOFFSET off = PadlistMAX(padlist) + 1;
+
+    PERL_ARGS_ASSERT_EXECSTATE_DERIVE_PADLIST;
+
+    /* steal the deepest live pad slot */
+    while (!PadlistARRAY(padlist)[off - 1])
+        --off;
+
+    pad_push(padlist, off);
+    newpad = PadlistARRAY(padlist)[off];
+    PadlistARRAY(padlist)[off] = NULL;
+
+    Newxz(newpadlist, 1, PADLIST);
+    Newx(PadlistARRAY(newpadlist), 2, PAD *);
+    PadlistMAX(newpadlist) = 1;
+    padnames = PadlistNAMES(padlist);
+    ++PadnamelistREFCNT(padnames);
+    PadlistNAMES(newpadlist) = padnames;
+    PadlistARRAY(newpadlist)[1] = newpad;
+
+    return newpadlist;
+}
+
+/*
+=for apidoc execstate_free_padlist
+
+Free a padlist created by L</C<execstate_derive_padlist>>.  A no-op during
+global destruction.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_execstate_free_padlist(pTHX_ PADLIST *padlist)
+{
+    PERL_ARGS_ASSERT_EXECSTATE_FREE_PADLIST;
+
+    if (PL_phase != PERL_PHASE_DESTRUCT) {
+        I32 i = PadlistMAX(padlist);
+
+        while (i > 0) {   /* index 0 is the shared names, freed below */
+            PAD *pad = PadlistARRAY(padlist)[i--];
+
+            if (pad) {
+                I32 j = PadMAX(pad);
+
+                while (j >= 0)
+                    SvREFCNT_dec(PadARRAY(pad)[j--]);
+
+                PadMAX(pad) = -1;
+                SvREFCNT_dec(pad);
+            }
+        }
+
+        PadnamelistREFCNT_dec(PadlistNAMES(padlist));
+        Safefree(PadlistARRAY(padlist));
+        Safefree(padlist);
+    }
+}
+
+/*
+=for apidoc execstate_topenv_root
+
+Return the base (outermost) handler of the live C<JMPENV> exception-handler
+chain - the root reached by following C<je_prev>.  A green-thread library
+captures this once to recognise the interpreter's own top level.
+B<Experimental.>
+
+=cut
+*/
+
+JMPENV *
+Perl_execstate_topenv_root(pTHX)
+{
+    JMPENV *te = PL_top_env;
+
+    while (te->je_prev)
+        te = te->je_prev;
+
+    return te;
+}
+
 void
 Perl_cx_dump(pTHX_ PERL_CONTEXT *cx)
 {
