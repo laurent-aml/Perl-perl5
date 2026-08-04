@@ -42,4 +42,36 @@ is XS::APItest::multicore::acquired(), 1,
 XS::APItest::multicore::uninstall();
 is XS::APItest::multicore::active(), 0, "uninstalled -> inactive again";
 
+# --- offload: multicore_offload / multicore_register_offload ---------------
+# no backend: work then done run inline, on the calling thread
+is XS::APItest::multicore::offload_active(), 0, "no offload backend -> inactive";
+XS::APItest::multicore::run_offload();
+is XS::APItest::multicore::off_workran(), 1, "inline offload ran work";
+is XS::APItest::multicore::off_doneran(), 1, "inline offload ran done";
+is XS::APItest::multicore::off_work_ctx_ok(), 1,
+    "inline offload handed work a well-formed context, with no cancel flag";
+is XS::APItest::multicore::off_done_ctx_ok(), 1,
+    "inline offload handed done a well-formed context, not cancelled";
+
+SKIP: {
+    skip "no pthreads in this build", 6
+        unless XS::APItest::multicore::have_pthread();
+
+    XS::APItest::multicore::install_offload();
+    is XS::APItest::multicore::offload_active(), 1, "offload backend registered -> active";
+
+    XS::APItest::multicore::run_offload();
+    ok XS::APItest::multicore::work_ran_off_thread(),
+        "offload: work ran on a different OS thread";
+    ok XS::APItest::multicore::done_ran_on_main(),
+        "offload: done ran on the calling (interpreter) thread";
+    is XS::APItest::multicore::off_work_ctx_ok(), 1,
+        "offload backend handed work a well-formed context";
+    is XS::APItest::multicore::off_done_ctx_ok(), 1,
+        "offload backend handed done a well-formed context";
+
+    XS::APItest::multicore::uninstall_offload();
+    is XS::APItest::multicore::offload_active(), 0, "offload backend unregistered";
+}
+
 done_testing;

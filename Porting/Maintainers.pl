@@ -1459,6 +1459,7 @@ our %Modules = (
                 lib/Net/protoent.{pm,t}
                 lib/Net/servent.{pm,t}
                 lib/PerlIO.pm
+                lib/PerlMulticore.pm
                 lib/Pod/t/Usage.t
                 lib/SelectSaver.{pm,t}
                 lib/Symbol.{pm,t}
