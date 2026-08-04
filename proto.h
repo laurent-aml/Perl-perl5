@@ -2603,6 +2603,22 @@ Perl_multiconcat_stringify(pTHX_ const OP *o);
 #define PERL_ARGS_ASSERT_MULTICONCAT_STRINGIFY  \
         assert(o)
 
+PERL_CALLCONV void
+Perl_multicore_acquire(void);
+#define PERL_ARGS_ASSERT_MULTICORE_ACQUIRE
+
+PERL_CALLCONV bool
+Perl_multicore_active(pTHX);
+#define PERL_ARGS_ASSERT_MULTICORE_ACTIVE
+
+PERL_CALLCONV void
+Perl_multicore_register(pTHX_ perl_multicore_hook_t release, perl_multicore_hook_t acquire);
+#define PERL_ARGS_ASSERT_MULTICORE_REGISTER
+
+PERL_CALLCONV void
+Perl_multicore_release(pTHX);
+#define PERL_ARGS_ASSERT_MULTICORE_RELEASE
+
 PERL_CALLCONV SV *
 Perl_multideref_stringify(pTHX_ const OP *o, CV *cv);
 #define PERL_ARGS_ASSERT_MULTIDEREF_STRINGIFY   \

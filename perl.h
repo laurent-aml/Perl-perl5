@@ -6086,6 +6086,16 @@ typedef struct exitlistentry {
 #  define  FAKE_DEFAULT_SIGNAL_HANDLERS
 #endif
 
+/* Only the multicore hook TYPES (a forward struct decl + the hook typedefs)
+ * need to be visible before perlvars.h / proto.h; pull in just those, not the
+ * struct body or the perlinterp_release/acquire macros, so an XS module that
+ * bundles the upstream perlmulticore.h does not get a colliding second copy in
+ * the same translation unit.  scope.c and opt-in modules include the whole
+ * header themselves. */
+#define PERL_MULTICORE_TYPES_ONLY
+#include "perlmulticore.h"
+#undef PERL_MULTICORE_TYPES_ONLY
+
 #if !defined(MULTIPLICITY)
 
 struct interpreter {
