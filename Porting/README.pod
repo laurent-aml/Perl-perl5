@@ -344,6 +344,12 @@ Steering Council.
 
 Shell script to list patches in RT.
 
+=head2 F<savestack_suspend_api.md>
+
+Specification of a core API that freezes, unwinds and later re-applies a region
+of the save stack, so that a module suspending a scope need not reimplement
+leave_scope in reverse.
+
 =head1 F<security_template.pod>
 
 Template to guide writers of a perl 5 security vulnerability
