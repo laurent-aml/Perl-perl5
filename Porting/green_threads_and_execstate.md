@@ -1,0 +1,1102 @@
+# Threads, green threads, and a core execution-state API for Perl
+
+## Purpose of this document
+
+This document studies the state of *threading* in Perl — both senses of the
+word: the several models by which Perl programs run more than one thing at a
+time, and the interpreter *execution state* that a thread of Perl execution is
+made of. It is written to motivate and frame a specific proposal: that perl
+core grow a small, additive, **public** API describing a thread's execution
+state, so that the green-thread libraries that today reach into private
+interpreter internals can instead stand on a supported contract.
+
+It is the rationale companion to `Porting/execstate_api.md`, which specifies the
+API itself (the "execstate" ladder). This document argues *why*; that one
+defines *what*. The reader is assumed to know Perl and C but not the internals
+of Coro or of the perl run loop.
+
+The argument runs: define what a thread is → separate concurrency from
+multi-core parallelism → survey how Perl does each today (ithreads, process
+pools, green threads) → observe where performance actually lives (XS) and what
+that implies for the model people want → look at how other languages resolve the
+same tensions → identify why the current Perl green-thread libraries are fragile
+→ propose the core API that removes the fragility.
+
+## What a thread is
+
+Following the ordinary computer-science definition (as summarised on Wikipedia):
+a **thread of execution** is the smallest sequence of programmed instructions
+that can be managed independently by a scheduler. Multiple threads within a
+single process run *concurrently* and *fully share the process's memory* and
+resources (address space, file descriptors, globals), in contrast to separate
+processes, which do not share those resources. A thread is therefore
+characterised by three things:
+
+1. an independent **flow of control** — its own instruction pointer and call
+   stack;
+2. **shared memory** with the other threads of the process; and
+3. **lightweight lifecycle management** — cheap to create, and cheap for a
+   scheduler to start, suspend, resume, switch between, and join.
+
+Nothing in that definition says *how* the scheduler runs the threads. It may
+interleave them on one CPU (time-slicing or cooperative yielding), or it may run
+them literally at the same instant on several CPUs. Both are threads.
+
+## Concurrency is the requirement; multi-core parallelism is a bonus
+
+It is worth stating plainly, because much confusion in the Perl community (and
+elsewhere) comes from conflating the two: **simultaneous execution on multiple
+cores is not part of the definition of a thread.** A thread requires
+*concurrency* — the ability to make progress on several flows of control whose
+lifetimes overlap — which is a *structuring* property. *Parallelism* — two
+instructions genuinely retiring in the same cycle on two cores — is a
+*performance* property, and an additional capability layered on top.
+
+The two are routinely provided separately. A great deal of software is threaded
+for concurrency alone and never runs two threads at once: a GUI keeps its event
+loop responsive while a "worker thread" waits on I/O; a network server keeps ten
+thousand connections in flight though only one is ever computing. Many runtimes
+deliberately *withhold* parallelism from their threads (Python's GIL, Node's
+single loop, cooperative green threads) precisely because withholding it removes
+whole classes of data race and lets threads share mutable memory safely.
+
+Parallelism is nonetheless the strongest possible bonus: it is the only way to
+make a CPU-bound program faster on modern hardware. So the interesting design
+question for any language is not "threads or not" but "which axis — concurrency,
+parallelism — do I get from which mechanism, and at what cost to shared state."
+Perl answers that question with several mechanisms, each landing at a different
+point on those axes.
+
+## Current pure-Perl solutions
+
+### Interpreter threads (`ithreads`)
+
+Perl's built-in `use threads` (interpreter threads, since 5.8) provides real OS
+threads. But it deliberately does *not* satisfy point (2) of the thread
+definition — it does not share memory. Creating an ithread **clones the entire
+interpreter**: every variable, pad, and package is deep-copied into the new
+thread, and thereafter the two are independent unless a variable is explicitly
+declared `:shared` (which routes every access through a lock and a serialised
+backing store).
+
+- **Pros.** They are genuine OS threads, so CPU-bound pure-Perl code *can* run on
+  multiple cores — the one Perl mechanism that gives shared-nothing parallelism
+  without a second process. No GIL, because there is nothing shared to lock.
+- **Cons.** The clone is expensive in both time and memory (a fresh interpreter
+  per thread), so thread creation is heavy and thread counts stay small. The
+  "shared memory" that makes threads pleasant is gone: `:shared` data is slow,
+  limited in type, and easy to get wrong; most CPAN modules are not thread-safe
+  across a clone; and the model is error-prone enough that `perldoc threads`
+  officially discourages its use for new code. It is, in effect, "processes that
+  look like threads," with most of the cost of processes and little of the
+  convenience of threads.
+
+Note the contrast with Python, drawn out below: Python threads *share* memory but
+*serialise* execution (the GIL); Perl ithreads *do not share* memory but *do*
+run in parallel. They are opposite trade-offs, and neither is the shared-memory,
+parallel thread people often imagine they are asking for.
+
+### Process pools with IPC
+
+The pragmatic mainstream answer to *parallelism* in Perl is not threads at all
+but **processes**: `fork` a pool of workers and communicate over pipes, sockets,
+or shared files. A rich CPAN layer packages this:
+
+- `Parallel::ForkManager` — the classic fork-a-worker-per-job pool.
+- `MCE` (Many-Core Engine) — chunked map/grep-style parallelism over a worker
+  pool, with shared queues.
+- `AnyEvent::Fork` / `AnyEvent::Fork::RPC` — fork a *template* process once,
+  cheaply, then spawn workers from it and drive them from an event loop.
+- `IO::Async::Function` — a pool of worker processes exposed as an
+  asynchronous function returning a `Future`, integrated with `IO::Async`.
+
+- **Pros.** True parallelism across all cores, with no interpreter-thread
+  fragility. Hard fault isolation: a worker that segfaults or leaks does not take
+  the parent down. No shared-mutable-state races — the isolation is enforced by
+  the OS. Scales to and beyond the machine (the same pattern extends to remote
+  workers).
+- **Cons.** No shared memory: every datum crossing a process boundary must be
+  *serialised*, sent, and deserialised, which dominates the cost for
+  fine-grained work or large working sets. `fork` itself is not free, copy-on-
+  write notwithstanding, and is problematic on Windows and inside threaded
+  parents. Coordinating many workers, back-pressure, and partial failure is real
+  work that the CPAN modules ameliorate but do not erase.
+
+Processes are the right tool for coarse-grained, CPU-bound, embarrassingly
+parallel work. They are a poor tool for keeping ten thousand mostly-idle I/O
+flows alive, or for sharing a big in-memory index.
+
+## What "green" threads bring
+
+**Green threads** are threads scheduled in user space, inside one OS thread of
+one process, by a library rather than the kernel. They *do* satisfy all three
+points of the definition — independent control flow, fully shared memory
+(they are all the same interpreter), and very lightweight management — while
+deliberately declining multi-core parallelism: at most one green thread runs at
+any instant, and control passes between them cooperatively.
+
+That combination is exactly what the process-pool approach lacks. Because every
+green thread lives in the same interpreter, they share all memory for free — no
+serialisation, no marshalling, a coro can hand another a reference to a
+multi-gigabyte structure at no cost. Because switching is a user-space register
+swap rather than a kernel context switch or an interpreter clone, they are cheap
+enough to have tens of thousands of them. The price is that they are
+*cooperative* and *single-core*: a green thread that neither yields nor blocks on
+a scheduler-aware operation starves all the others, and no green thread ever
+speeds up a CPU-bound computation, because they never run at the same time.
+
+Perl has two mature green-thread libraries, built on opposite mechanisms:
+
+- **Coro** — *stackful* coroutines. Each coro has its own real C stack and its
+  own copy of the interpreter's execution stacks; a switch saves one set of
+  those and installs another, and (when needed) swaps the C stack too. Because a
+  coro owns a full stack, it can suspend **anywhere** — deep inside nested
+  function calls, inside a `map` block, even inside an XS call that calls back
+  into Perl — simply by yielding. `$coro->cede`, `Coro::Semaphore`, channels,
+  etc. are built on this.
+- **Future::AsyncAwait (FAA)** — *stackless* async/await. `async sub`/`await`
+  transforms a subroutine into a resumable state machine; suspension is only
+  possible at an explicit `await` on a `Future`, and only within an `async sub`,
+  not across an ordinary Perl or C frame. It integrates with the `Future` /
+  `IO::Async` ecosystem and reads like modern async code in other languages.
+
+## Stackful vs stackless: the technical difference
+
+The two libraries answer one question differently: *what is a suspended thread,
+concretely, and what must be preserved to resume it?*
+
+- **Coro (stackful)** treats a suspended thread as an entire live execution
+  context frozen in place. To resume it you restore the interpreter's execution
+  registers — the value/mark/scope/save/temporaries stacks, the current op and
+  COP, the pad, the compile-time cursors, the flags — and the C stack the coro
+  was running on, and jump back in. Suspension is transparent to the code being
+  suspended: it does not know or care that it is a coro. This is powerful
+  (suspend anywhere, including under XS) and it is O(1) in the amount of live
+  state — you swap pointers to whole stacks, you do not walk them.
+
+- **FAA (stackless)** treats a suspended thread as a captured *continuation of an
+  async sub*: enough saved state to re-enter that sub at its `await` point. It
+  does not own a C stack, so it cannot suspend through a frame that is not itself
+  an `async sub` — a plain sub, or an XS function, on the call chain is a barrier.
+  Capturing the state is proportional to the depth being suspended (it must
+  freeze the relevant save-stack region), i.e. O(n) rather than O(1), but the
+  per-thread footprint is much smaller because there is no reserved C stack.
+
+Several differences follow from that — some bearing on how much core support
+each model needs, some on what the programmer may actually write:
+
+- **Creation.** Coro spawns *explicitly* — `async { ... }` (or a constructor)
+  puts a new coro on the scheduler. FAA has no spawn primitive at all: calling an
+  `async sub` runs it synchronously to its first `await`, and if the awaited
+  Future is not yet ready the frame suspends and hands a *pending Future* back to
+  its caller. A concurrent thread therefore exists precisely when such a pending
+  Future is left in flight rather than awaited inline — concurrency arises from
+  the event loop driving several outstanding Futures, not from any create call.
+- **The caller stack.** A stackful coro keeps its real call stack, so the
+  Perl-level `caller()` chain and argument frames are simply *there* on resume. A
+  stackless FAA thread has unwound the real stack at each suspension, so it must
+  *reconstruct* — simulate — that caller chain when it resumes, so that code in a
+  resumed `async sub` still sees a coherent call history. That simulation is
+  extra machinery a stackful design does not need at all.
+- **Cancellation.** Cancelling a suspended coro means unwinding a real, live
+  dynamic scope, and Coro offers two flavours. *Prompt* cancel (`cancel`) tears
+  the coro down at once from the canceller's context; *safe* cancel
+  (`safe_cancel`) unwinds the coro in its **own** context at a cancellable point,
+  so its `local` restorations, `DESTROY`s and `finally`/guard blocks run in the
+  correct order **and may themselves block** — a guard can cede and wait while
+  cleaning up. That cleanup is *allowed to block* is the whole point of
+  `safe_cancel` over prompt cancel (and it is the delicate teardown this document
+  keeps returning to).
+
+  A stackless FAA thread has no such stack to unwind. Synchronous cleanup — a
+  `defer` block, or a guard object's `DESTROY` — still runs, but it cannot
+  `await`, so *asynchronous* cleanup on cancellation (cleanup that must itself
+  `await`) has no shipped mechanism today: it is an open proposal, the
+  `Future::With` approach — not (yet) a CPAN module; see RT #171969
+  (https://rt.cpan.org/Public/Bug/Display.html?id=171969). So the contrast is
+  sharper than a difference of syntax: Coro already runs blocking cleanup on
+  cancellation, via `safe_cancel`, whereas for FAA asynchronous cancellation
+  cleanup is still unsolved.
+- **Dynamic scope and implicit variables.** Because a stackful coro carries its
+  *entire* dynamic scope with it, `local`, `$_`, `@_`, `wantarray`, and
+  `await`-ing inside a `map`/`grep`/`sort`/`eval` block behave exactly as they do
+  in ordinary code — the coro resumes with the same dynamic state it left. A
+  stackless FAA thread does not own that scope, and so carries a set of
+  documented limitations. The sharpest is that a plain `local` does not compose
+  with `await` — its effect would remain in force for whatever runs during the
+  suspension — which is why the await-aware `dynamically` keyword
+  (`Syntax::Keyword::Dynamically`) had to be introduced as its replacement.
+  `$_` and other implicit/global variables are likewise not reliably preserved
+  across an `await`; call context is subtle, because an `async sub` hands a
+  `Future` back in its caller's context and only produces its real value later,
+  so `wantarray` inside it does not mean what it does in an ordinary sub; and
+  there are further restrictions on where an `await` may appear. The
+  Future::AsyncAwait documentation carries the current list. These
+  are less defects than the standing price of *not* carrying the full execution
+  state — precisely the state a stackful coro swaps wholesale, and precisely what
+  a core execution-state API would let it swap through a supported surface.
+- **Adoption cost — function "coloring."** For a sub to `await`, it must be an
+  `async sub`, and its callers must `await` it (or be `async` themselves), so the
+  annotation propagates up the *entire* call graph — the well-known "what colour
+  is your function" problem — and, as above, `local` must be rewritten as
+  `dynamically`. Adopting FAA in an existing code base is therefore an invasive,
+  transitive source rewrite. Coro is *colorless*: unchanged, ordinary subs can
+  cede or block, because suspension need not appear in the signature of every
+  function on the stack — the same property Go's goroutines and Java's virtual
+  threads are prized for.
+- **Explicit vs implicit suspension — knowing where you can block.** The mirror
+  image of coloring, and here the advantage is FAA's — though narrower than it
+  first appears. Coro is *cooperative*, not preemptive: a coro yields only where
+  it (directly or transitively) calls something that cedes, so the programmer
+  still controls where suspension may happen, and between those points code runs
+  to completion with nothing else interleaving. That controlled atomicity is
+  itself a feature for avoiding concurrency bugs. What Coro lacks is not control
+  but *visibility at the call site*: a plain method or sub call does not advertise
+  whether it might cede somewhere inside, so in code one did not write it is hard
+  to tell which calls are suspension points. FAA makes that explicit — every
+  suspending call is an `await` — and, more strongly, *structurally forbids*
+  suspension where `await` is not allowed: inside a `DESTROY`, a tie or overload
+  method, a signal handler, cleanup and magic are guaranteed synchronous. Coro
+  cannot make that guarantee — a `DESTROY` run at an arbitrary refcount drop or
+  during global destruction *may* cede and switch coros at an unsafe moment, with
+  no parse-time way to detect or forbid it. So the honest gap is call-site
+  visibility, and the un-checkable no-suspend contexts, not any loss of control
+  over suspension itself.
+
+  The second half of that gap can be closed from Coro's side, and an
+  experimental (as-yet-unpublished) `Coro::Atomic` does so: an `atomic { ... }`
+  section — equivalently a scope guard, or an `:Atomic` sub attribute — marks a
+  region the running coro must not yield in. It is enforced *deterministically*
+  at Coro's scheduler entry points (so it catches C-level blocking such as a
+  semaphore or condvar wait too, not just an explicit `cede`), before any
+  ready-queue state is touched, so a stray suspension inside it — including
+  inside a `DESTROY` — is a fatal error rather than a silent switch. This does
+  not make cede-ability *visible* at every call site (that would need FAA-style
+  coloring), but it lets cleanup and critical sections *guarantee* no
+  suspension, which is the property that most mattered — the complement of "flag
+  what may block" is "forbid blocking here," and it composes with dynamic
+  dispatch where a static scheme cannot.
+- **Scheduling.** Coro is a *scheduler*, not only a suspension mechanism: it has
+  a ready queue, thread priorities, explicit `cede` / `schedule`, and time-sliced
+  yielding (such as the clock-based `cede_slice` — as-yet-unpublished work — which
+  lets a long computation yield cooperatively with no external timer). FAA has no
+  scheduler of its own —
+  it yields suspendable tasks and leaves *when* they run to the driving event
+  loop, with no built-in cooperative-yield or time-slice primitive. FAA is the
+  suspension syntax; Coro is suspension *plus* a scheduler.
+- **Native tooling — and here the debit is Coro's, but a modest one.** It is
+  tempting to say C-level debuggers "cannot follow" a coro; that overstates it.
+  C-level debugging of a *Perl* program is mostly about one's own XS, not about
+  stepping perl's run loop (rarely useful), and that still works: a breakpoint in
+  an XS function fires normally under Coro, and while stopped you can inspect that
+  frame and walk the current coro's C stack up to where it was entered, because a
+  *running* coro's C stack is an ordinary contiguous stack. What the private
+  stacks and the hand-written switch actually cost is the *cross-coro* picture: a
+  C backtrace does not continue coherently past a coro's entry (the frames beneath
+  it are on another stack, and the switch carries no unwind information), the C
+  stacks of *suspended* coros are not walkable at all, and sampling profilers get
+  confused at switch boundaries. So the loss is whole-program C backtraces and
+  clean cross-coro profiling — not the everyday "break in my XS and look around."
+  The *Perl* debugger fares well too. Tested (perl 5.40, Coro 6.57): it runs Coro
+  programs, breakpoints fire in every coro, and — since a running coro's stack
+  *is* the live interpreter stack — variable inspection and `T` backtraces are
+  correct for whichever coro is stopped; what it cannot do is confine control flow
+  to one coro, since its step/continue state is global, so `c`/`n`/`s` follow the
+  interpreter across every `cede` and hop between coros. (Coro ships its own
+  `Coro::Debug` — a coro-listing, backtrace and remote-shell introspector — for
+  exactly this reason.) FAA, on the ordinary C stack, is friendlier still. A real
+  cost of the stackful model, but a narrower one than "debuggers cannot follow
+  Coro" would suggest.
+
+For all those differences, Coro and FAA share the one property that matters most
+here: each must reach into interpreter state that Perl does not expose as API.
+Coro copies the `PL_*` execution registers and manipulates the context-stack and
+padlists directly; FAA freezes and thaws a region of the save stack. The two
+reach into the same private machinery from opposite ends — Coro swapping the
+*whole* state, FAA freezing a *slice* of it.
+
+### Is FAA the simpler, "solved" answer? An honest reckoning
+
+One reading colours much of this discussion and should be named directly: that
+Future::AsyncAwait is the clean, modern successor whose async/await makes Coro's
+stackful "hackery" unnecessary, so core need only bless FAA and let Coro fade.
+On the axes this document is about, that reading does not hold up, and it is more
+honest to say so plainly.
+
+FAA does simplify one real thing: being stackless it never touches the C stack or
+the context stack, so it needs no per-platform assembly switch backend, is
+correspondingly more portable to build, has a smaller per-suspension footprint,
+and integrates natively with the `Future`/event-loop world. Those are genuine
+merits, and they are why many reach for it first.
+
+But "simpler in that dimension" is not "simpler," and it is certainly not
+"internals-free." FAA depends on the *same class* of unpublished interpreter
+state as Coro — it freezes and thaws the save stack — so it does not escape the
+problem that motivates a core API; it reaches into it from the other end. And a
+*complete* FAA needs machinery Coro does not: simulating the `caller()` stack
+across suspension, and a dedicated construct for asynchronous cancellation. The
+net is that the core surface needed to underwrite FAA (parkapi, plus those) is
+*larger* than the one needed to underwrite Coro (execstate) — the opposite of the
+intuition.
+
+Nor does FAA solve any *technical* problem that Coro has. Both are single-core
+and cooperative; neither adds parallelism. Both depend on interpreter internals;
+neither is inherently stable across releases. And FAA is not even a superset:
+it is the suspension *syntax*, not a scheduler, so it has no `cede`/`cede_slice`
+equivalent of its own and leans on the event loop for *when* things run. What
+FAA changes is the *trade*, not the ledger: it buys visible, explicit suspension
+points and portability, at the cost of Coro's transparency. It cannot suspend
+through a non-`async` or XS frame; it gives up dynamic-scope fidelity (`local`,
+`$_` and friends need `dynamically`, or do not survive an `await`); and it
+*colors* the call graph, so adopting it means an `async`/`await` rewrite up the
+whole chain — where Coro is colorless. The trade runs the other way in two
+places. One is tooling: Coro's private C stacks cost the cross-coro view —
+whole-program C backtraces and clean profiling across coros — though a breakpoint
+in your own XS still fires, and the Perl debugger, while usable, is not
+coro-aware; FAA sits on a normal C stack. The other is explicitness: FAA's visible `await`
+points make every suspension site visible at the call and *structurally* bar
+suspension where `await` is not allowed (a `DESTROY`, say). Coro is still
+cooperative — the programmer controls where yielding happens — but cede-ability
+is not visible at a call site, and suspension in an un-checkable context like
+`DESTROY` cannot be forbidden at parse time. None of this reads as "one is simpler"; it reads as two different
+bargains.
+
+So the two are not "hacky old" versus "clean new." They are stackful-transparent
+versus stackless-explicit — each capable, each buying one property with another —
+and neither makes the execution-state problem disappear. If anything the smaller,
+more self-contained core commitment is the one the stackful model needs, and it
+happens to enable the more capable (suspend-anywhere, scope-faithful) style. The
+serious answer is to support both styles on one published foundation — execstate
+for the stackful half, parkapi for the stackless — not to bet that one style's
+syntax dissolves the other's requirements.
+
+### Pros and cons versus the alternatives
+
+- **Pros.** Shared memory with no marshalling; extremely cheap creation and
+  switching; a natural, synchronous-looking way to write highly concurrent I/O
+  code (tens of thousands of connections in one process). Coro additionally lets
+  ordinary, unmodified, blocking-style code participate, because it can suspend
+  anywhere.
+- **Cons.** No parallelism on their own — one core, cooperative scheduling, so a
+  runaway CPU-bound section blocks everything, and green threads never make
+  computation faster. Any *truly* blocking call (a raw `read`, a blocking XS
+  routine) that is not scheduler-aware blocks the whole process. And — the
+  subject of this document — both depend on interpreter internals that core does
+  not promise to keep stable.
+
+## Where the performance is: "Pure Perl orchestrates, XS executes"
+
+To see what model Perl users actually want, look at where time is spent. The
+Perl interpreter is, for tight numeric or byte-processing loops, one to several
+orders of magnitude slower than C. The community learned long ago not to fight
+this but to *arrange around it*: performance-critical work is pushed into **XS**
+(or into C reached through `Inline::C`, `FFI::Platypus`, or an existing XS
+module), while Perl itself does the gluing, control flow, configuration, and
+I/O. PDL, `JSON::XS`, `Text::CSV_XS`, DBD drivers, the regex engine, and the
+whole "\_XS" tail of CPAN exist for this reason.
+
+The consequence for parallelism is decisive. The place where running on multiple
+cores actually pays is the **XS/C** computation, not the pure-Perl orchestration.
+Pure Perl spends most of its wall-clock either waiting on I/O (a concurrency
+problem, not a parallelism one) or delegating to C. So the model most Perl
+programs would benefit from is:
+
+- **Pure Perl orchestrates** — one interpreter, single-threaded, using **green
+  threads** to keep thousands of I/O flows and delegated computations in flight
+  concurrently, and using **process pools** where coarse pure-Perl parallelism is
+  genuinely needed;
+- **critical-performance XS executes** — and, when a piece of XS is CPU-bound or
+  makes a blocking syscall, it does so on a **real OS thread**, off the single
+  interpreter thread, so it can either run on another core or simply not stall
+  the scheduler.
+
+This is precisely the pattern that works so well elsewhere. In Python, the
+numeric stack (NumPy, and friends) *releases the GIL* around its C kernels: Python
+stays single-threaded and safe, while the heavy C runs on OS threads and uses all
+the cores. The Perl analogue is: keep one interpreter, let green threads schedule
+the Perl side, and let blocking or CPU-bound XS run on OS threads. Threading *the
+XS part* — not the Perl part — is what most people are really after.
+
+### Coro::Multicore
+
+`Coro::Multicore` implements exactly this. It couples Coro's cooperative
+scheduler to a pool of real OS threads so that a **blocking operation can be run
+on an OS thread while the Coro scheduler keeps running other coros** on the main
+interpreter thread. When a multicore-aware call blocks, the current coro is
+suspended, the blocking work proceeds on a worker OS thread, and the interpreter
+is free to make progress elsewhere; when the worker finishes, the coro is made
+ready again. The Perl level stays single-threaded and cooperative — no shared-
+interpreter races — while the C level gains both I/O concurrency and, for
+CPU-bound C kernels, real multi-core execution.
+
+For this to be useful, individual XS modules opt in — marking the points where
+they may safely release the interpreter and run their C on a worker thread. Work
+in this vein includes multicore-aware modes for database drivers (e.g. a
+`DBD::SQLite` option), XML parsing (`XML::LibXML`), and generic foreign calls
+(`FFI::Platypus`), each letting its blocking C run off the interpreter thread
+under Coro::Multicore. The picture that results — Perl orchestrating, green
+threads scheduling, and OS threads carrying the heavy XS — is the whole model in
+one place.
+
+What makes this approach attractive is *how little* it asks of the module.
+Offloading a blocking XS routine to a separate OS thread is always possible in
+principle, but the general route is invasive: the module has to be rewritten to
+dispatch its C work to a thread pool and expose an asynchronous, callback- or
+`Future`-returning interface — its synchronous API, and usually its internals,
+must change. Coro::Multicore instead migrates the *whole coro* onto a worker
+thread around the module's existing blocking call, so an ordinary synchronous XS
+module can be upgraded to multicore with only a thin opt-in at its blocking entry
+points — its API and its C code stay as they are. That is why the multicore
+variants above are small adapters over unchanged modules rather than rewrites: an
+existing XS module can be made multicore-aware almost transparently, where the
+explicit-offload approach would demand a redesign.
+
+There is a natural generalization worth flagging, in the same spirit as the rest
+of this document: that opt-in need not be Coro-specific. What an XS module
+declares — *"I am about to run a blocking or CPU-bound C section that does not
+touch the interpreter; offer to run it off the scheduler thread"* — is precisely
+Perl's analogue of CPython's `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS`
+bracket, which every C extension uses to release the interpreter around blocking
+work, independent of any one concurrency library. Perl core could expose the same
+neutral bracket as a public hook: the module marks its blocking C section against
+the *core* API, and whatever offload **backend** is loaded — Coro::Multicore
+today, a future core scheduler, or none — decides what to do: dispatch the work
+to a worker OS thread and suspend the green thread, or, absent any backend, run
+it inline and blocking exactly as today. Core would supply the convention and the
+hook point, not the thread pool or the migration machinery, which stay in the
+backend. Two constraints are inherent and worth stating: the bracketed section
+must be **pure C that does not call into the interpreter** (the same discipline
+`Py_BEGIN_ALLOW_THREADS` demands, since it may run while the main thread makes
+other progress); and Perl's backend is intrinsically harder than Python's —
+Python merely releases the GIL and the C runs on the same OS thread, whereas Perl,
+lacking interpreter-sharing threads, must *migrate* the work to a worker and
+coordinate resumption. Done this way an XS module would be written once to be
+offload-friendly without depending on Coro at all — the same decoupling execstate
+performs for the stackful context switch, applied to the blocking-C boundary. It
+is a distinct, complementary proposal, not part of execstate, developed as *A
+companion: a core multicore hook* below.
+
+## How other languages resolve the same tensions
+
+Every managed language faces the same three-way tension between shared memory,
+parallelism, and safety, and the designs cluster into a few recognisable
+answers. Perl's mechanisms are not exotic; they are points in this shared space.
+
+- **JavaScript / Node.js.** A single-threaded event loop with stackless
+  `async`/`await` (like FAA) for concurrency, and *no* shared-memory threads in
+  the language: parallelism comes from Web Workers / `worker_threads`, which are
+  separate heaps communicating by message passing (like Perl's process pools),
+  with only `SharedArrayBuffer` as a narrow shared-memory escape hatch.
+  Concurrency in-heap, parallelism out-of-heap.
+
+- **Python.** The richest menu, and the closest parallel to Perl's situation.
+  `threading` gives real OS threads that share memory but are serialised by the
+  **GIL**, so they help I/O-bound code and not CPU-bound code — hence the
+  release-the-GIL-in-C pattern described above. `multiprocessing` gives
+  process-pool parallelism (Perl's fork pools). `asyncio` is stackless
+  async/await (FAA/Node). `greenlet`/`gevent` are stackful green threads (Coro).
+  And Python is now dismantling the central constraint: per-interpreter GILs
+  (3.12) and an experimental free-threading, no-GIL build (3.13+) aim at genuine
+  shared-memory parallel threads.
+
+- **Go.** The design many hold up as the goal: **goroutines** are stackful green
+  threads with small growable stacks, multiplexed **M:N** onto a pool of OS
+  threads by the runtime's work-stealing scheduler. They give shared memory,
+  cheap creation *and* real multi-core parallelism at once, with communication by
+  channels (CSP). The cost is that this only works because the whole runtime and
+  memory model were co-designed for it — the GC, the scheduler, and the stack
+  layout all cooperate.
+
+- **Erlang / BEAM.** Massive numbers of green *processes* that share *nothing* and
+  communicate only by message; the scheduler is preemptive and multi-core. Safety
+  by isolation rather than by locking — the opposite end from Go.
+
+- **Java.** Long the canonical heavy-OS-thread, shared-memory, locked model;
+  Project Loom's **virtual threads** now add Go-style M:N green threads on top of
+  the same shared heap, letting old blocking code scale like async code.
+
+Read against this map, Perl has strong instances of the *concurrency* answers
+(Coro ≈ gevent/goroutine-shaped stackful; FAA ≈ asyncio/Node stackless) and of
+*out-of-heap parallelism* (fork pools ≈ multiprocessing/workers), but its one
+*in-heap parallel* mechanism, ithreads, took the shared-nothing clone route and
+is discouraged. The realistic near-term target is therefore the Python/Node
+consensus — single safe interpreter, green threads for concurrency, OS threads
+under the XS for parallelism — rather than a Go-style rewrite of the runtime.
+
+It is worth being explicit about why the *other* Python route — 3.13's
+free-threading, no-GIL build — is not an option for Perl, because it is the
+obvious "why not just remove the lock?" question and the answer is instructive.
+Perl has **no GIL to remove**: it never had shared-memory interpreter threads in
+the first place (ithreads *clone*), so the task is not to delete a lock but to
+*build* a thread-safe shared interpreter from scratch — strictly harder than
+CPython's job, not easier. That means making all of Perl's shared mutable
+internals safe for concurrent access: the reference counts on every SV, the
+magic/tie machinery, the pad system, the pervasive `PL_*` globals, and the
+dynamic-scope (`local`/save-stack) model that is per-thread-of-execution but acts
+on shared variables. PEP 703 needed exactly this class of work for CPython —
+biased and deferred reference counting, per-object locks, thread-safe containers,
+immortal objects, a reworked cycle collector — delivered over years by a large,
+funded team, with a single-thread performance cost and a multi-release migration.
+Perl has a fraction of that engineering capacity, arguably more entangled
+internals, and — decisively — a vast, old, largely unmaintained XS ecosystem that
+manipulates SV internals and refcounts with no notion of thread-safety; making
+the *core* safe would not make that code safe, and there is no one to port it the
+way CPython's top C extensions are being ported. And the payoff would be
+misaligned even if it were free: a free-threaded interpreter parallelises
+*pure-Perl* execution — the slow half one would rather delegate — whereas the
+parallelism that actually pays, the XS/C kernels, is already reachable by running
+XS on OS threads (the orchestrate/execute model above), the same
+release-the-lock-in-C pattern Python itself leans on. So the cost is far higher
+and the benefit far lower for Perl than for Python; the leverage is in threading
+the XS, not in un-threading the interpreter.
+
+## The stability problem with Coro and FAA
+
+Both green-thread libraries work, and work well, but both are perennially at risk,
+and for the same underlying reason: **they depend on interpreter state and
+behaviour that core neither exposes as API nor promises to keep stable.**
+
+Coro is the sharper case because it swaps the *whole* execution state. It reads
+and writes the private `PL_*` execution registers directly; it overlays its
+saved state on the context stack, which requires exact knowledge of `PERL_SI` and
+`PERL_CONTEXT` layout; it clones padlists by hand, which the internal padlist
+representation has broken more than once; and it must tear a coroutine down in an
+exact order dictated by how perl's scope, context, and pad machinery interlock.
+Every one of these is a place where a perl release can — and historically does —
+change something private out from under it:
+
+- the save/scope/pad **teardown order** is a hard contract that *tightened*
+  between perl versions: unwinding in the wrong order leaves an outer frame's pad
+  slot stale and corrupts refcounts, asserting or segfaulting in `leave_scope` on
+  modern perls (a real, debugged corruption when a coro is cancelled while
+  blocked with a `local` in scope);
+- the save-stack `SS_MAXPUSH` accounting moved from header macros into
+  `PL_savestack_max` in 5.24;
+- the padlist representation changed across the `NEWPADAPI` and 5.15.3 reworks;
+- and the low-level C-stack switch needs a hand-written assembly backend on some
+  platforms (it is required on arm64), while the portable `setjmp`/`longjmp`
+  backend is fragile enough that `Coro::Multicore` deadlocks on it.
+
+FAA is more robust in scope — stackless, so it never touches the C stack or the
+context stack — but it is fragile in kind for the same reason: it freezes and
+thaws a region of the **save stack**, and the save stack's per-type layout is an
+internal detail. Both libraries are, in effect, privately maintaining a fork of
+perl's understanding of its own execution state, and re-validating it against
+each release.
+
+The result is a recurring tax: green threading in Perl is powerful but has a
+reputation for breaking on new perls, needs per-version patching, and leans on a
+single expert's continued attention. The fragility is not in the *idea* of green
+threads; it is in the *coupling* to unpublished internals.
+
+## The proposal: publish the execution state as a core API
+
+The fix is to move the interpreter-internals knowledge out of the libraries and
+into perl core, behind a small, additive, **public** API — so that a green-thread
+library calls a supported function instead of reaching into `PL_*`, and core owns
+(and keeps stable, and maintains next to the machinery it depends on) the
+contract those libraries need. Concretely, two complementary APIs, matching the
+two mechanisms:
+
+- **execstate** — the *stackful* half, for Coro. A small ladder of operations on
+  a thread's whole execution state, specified in `Porting/execstate_api.md`:
+  1. **register snapshot** — a transparent `PerlExecState` plus `execstate_save`
+     / `execstate_load` to copy the generic execution registers to and from the
+     live interpreter;
+  2. **fresh-stack lifecycle** — `execstate_init` / `execstate_unwind` /
+     `execstate_destroy`, which own the delicate teardown order once and for all;
+  3. **pad** — `execstate_derive_padlist` / `execstate_free_padlist` for
+     re-entering a sub on an independent context;
+  4. **transfer registers** — the `JMPENV` exception-handler state that must
+     follow a C-stack switch (`execstate_topenv` and friends).
+
+  Because it is a **capability ladder** gated by `PERL_EXECSTATE_LEVEL`, core can
+  adopt it incrementally: it advertises how far up it implements, and a consumer
+  backfills only the levels core lacks. Deliberately *out* of the API is the
+  machine-level C-stack switch itself — that is a pluggable, platform-specific
+  mechanism (the assembly/`ucontext`/`setjmp` backends) and rightly stays the
+  library's own; only the interpreter *state* that a switch must carry is
+  core's concern.
+
+- **parkapi** — the *stackless* half, for FAA and similar: a supported way to
+  freeze and thaw a save-stack region, so that async/await libraries stop
+  depending on the internal per-type save-stack layout. This half is now
+  **prototyped**: the freeze/thaw/frozen-free/run-deferred/foreach-sv entry
+  points cover the value-localization, pad-scope, deferred-action *and* magical
+  (`%ENV`/`%SIG`, whole and per-element) save types, and a prototype migration of
+  Future::AsyncAwait onto it — replacing its hand-written per-`SAVEt_` switch —
+  passes FAA's own test suite, including `local %ENV`/`%SIG` across an `await`.
+  See `Porting/savestack_suspend_api.md` for the specification.
+
+An honest note on their relative cost, since it cuts against the usual
+intuition. The stackful model, often dismissed as the hacky one, needs the
+*smaller* core API; the stackless model, usually held up as the clean modern
+design, needs the *larger* one. execstate is compact — a fixed register list, a
+mechanical save/load, a short lifecycle, all copies and pointer swaps.
+parkapi must understand the save stack *per save type*, freezing and thawing each
+`SAVEt_*` correctly, which is inherently more code and more coupling to internal
+semantics; and a *complete* stackless implementation needs still more that has no
+stackful analogue — it must **simulate the `caller()` stack** across suspension
+(a stackful coro keeps it for free), and **asynchronous cancellation cleanup** is
+not even solved yet: no shipped FAA mechanism provides it, only the proposed
+`Future::With` approach (not a CPAN module; RT #171969), where a stackful coro's
+`safe_cancel` gets blocking cleanup for free by unwinding its real dynamic scope.
+So underwriting FAA is the heavier commitment of the two — a larger, more
+internals-coupled core piece (parkapi) plus machinery Coro simply does not need —
+even though execstate is the one attached to the more contentious library.
+
+Both are designed to be **purely additive and ABI-safe**: `PerlExecState` is a
+standalone struct a consumer overlays on its own memory; the operations copy or
+walk existing state rather than changing any representation; no existing
+interpreter variable or struct is altered. Adopting them removes nothing and
+risks nothing for code that does not use them, while turning the green-thread
+libraries' most dangerous dependency — private, drifting internals — into a
+stable surface that core tests and maintains. The historically version-sensitive
+pieces (the teardown order, the `SS_MAXPUSH` accounting, the padlist handling)
+become core's responsibility, living beside the very code whose changes used to
+break Coro, so that the next such change updates the API in lock-step instead of
+silently breaking a CPAN module.
+
+## A companion: a core multicore hook
+
+Separate from execstate, but in the same spirit, is a second, much smaller core
+addition: promoting the *Perl Multicore Specification*'s release/acquire bracket
+(see the Coro::Multicore discussion above) from a bundled CPAN header into core.
+It is included here because it is prototyped alongside execstate and rounds out
+the "thread the XS, not the interpreter" model — but it stands entirely on its
+own and could land independently.
+
+**The API.** A core `perlmulticore.h` gives an XS module the same three tokens
+it uses today, now core-provided:
+
+```c
+perlinterp_release ();      /* offer to run the following pure-C section off the */
+do_the_blocking_C_thing (); /* interpreter thread; touch no perl data here       */
+perlinterp_acquire ();
+```
+
+plus `perlmulticore_active()` and a registration entry point,
+`multicore_register(release, acquire)`, for a backend. With no backend installed
+the bracket is a nop and the section runs inline and blocking, exactly as today.
+
+Alongside the bracket the API carries its dual, the **offload** primitive. Where
+the bracket migrates the interpreter to a worker while the blocking call stays on
+the caller's thread, offload keeps the interpreter *pinned* and moves the **work**
+to a worker:
+
+```c
+SV *ret = multicore_offload (work, work_arg,   /* pure-C `work` -> a worker thread       */
+                             done, done_arg);  /* `done` -> interp thread, returns an SV  */
+```
+
+`work` is pure C and touches no interpreter; `done` runs on the interpreter thread
+when the work finishes and marshals the C result into an SV. What
+`multicore_offload` *returns* — and thus the call's shape — is decided entirely by
+the registered backend: a **stackful (Coro)** backend suspends the calling green
+thread and resumes it to run `done`, returning the value directly, so the
+offloaded call looks synchronous; a **stackless (Future::AsyncAwait)** backend
+returns a Future that `done` resolves, for the caller to `await`. The core
+primitive is neutral — it just forwards work/done and returns whatever SV the
+backend produced — so a consumer that offloads its C call needs *no* knowledge of
+Coro, FAA, rouse, or Future. Registered by a backend with
+`multicore_register_offload(fn)`; with none it runs `work` then `done` inline and
+returns `done`'s SV. It is a *separate* hook, not an extension of the
+release/acquire struct (whose two-pointer layout is a frozen ABI); a pool-owning
+backend can register both.
+
+Offload's reach is broader than the bracket's, at a higher cost to the module.
+Because the worker never touches the interpreter and the interpreter never moves,
+offload serves **both** the stackful (Coro) and stackless (Future::AsyncAwait)
+models, and it works on **every platform, Windows included** — none of the
+interpreter-migration constraints that limit the bracket apply (see *Portability:
+on Windows* below). The price is **deeper changes to the XS module**, plus a
+**function-colouring** boundary the module must own. It restructures the blocking
+operation into a pure-C `work()` (inputs marshalled out of SVs beforehand) and a
+`done()` that marshals the result back — and, because a *stackless* caller cannot
+receive a value synchronously, it must expose the offloaded form as an explicitly
+**asynchronous** entry point (e.g. a `..._async` method returning the deferred),
+distinct from the plain synchronous call. Under Coro that async call is
+transparent (returns the value); under FAA it returns a Future to `await`. A
+generic XS module therefore has to *add* an async twin for each offloadable
+method — the price of colouring. So the bracket is the near-transparent upgrade
+for existing synchronous Unix+Coro modules, and offload is the portable,
+model-agnostic path for code written — or rewritten — for it.
+
+The whole core surface is a short header, two interpreter-global hooks, and a
+handful of tiny functions — the hard machinery (the worker-thread pool, the
+migration of the running thread) stays entirely in the backend.
+
+**Backward compatible by construction.** The prototype keeps the *exact wire ABI*
+of the deployed CPAN `perlmulticore.h`: the two hooks live in a struct in
+`PL_modglobal["perl_multicore_api"]` with the field names `pmapi_release` /
+`pmapi_acquire`, and core caches a pointer to that same struct. So everyone meets
+at one rendezvous, and nothing downstream needs changing: an already-installed
+**Coro::Multicore drives a module built against core's header** (it writes the
+struct core reads), and a core-`multicore_register` backend drives existing
+bundled-header modules (it writes the struct they read). In particular
+Coro::Multicore itself needs **no update** — indeed it should keep its bundled
+header so it still works on perls that predate the core one. (A test installs a
+backend the CPAN way — writing the struct directly, as Coro::Multicore's BOOT
+does — and confirms core's bracket drives it.)
+
+**What the gain is — and is not.** Honestly, this is a modest, mostly
+ecosystem-level win, and it is worth being clear about its shape:
+
+- It adds **no new capability, no performance, and no behaviour** — the bracket
+  already works via the bundled header, and it still does nothing without a
+  backend installed.
+- The tangible benefit is that a new module uses a **core-provided, canonical,
+  neutral header** instead of vendoring schmorp's copy — and that the convention
+  becomes a *documented Perl capability* rather than "a CPAN header you copy in,"
+  decoupled from Coro. That legitimacy/neutrality is the real point, the same one
+  execstate makes.
+- Even the "stop vendoring" benefit is **deferred**: a module supporting perls
+  older than the one that first ships the header must keep a bundled fallback
+  until that perl is its minimum, so the practical saving arrives years later.
+- A genuine *future* upside it unlocks: because the hook is core's, core could one
+  day ship a **default backend** (even a minimal thread pool), so the bracket does
+  something useful out of the box without any CPAN backend at all.
+
+So the stakes are far smaller than execstate's — a small vendored header versus
+the fragile, version-sensitive interpreter internals — but the move is the same:
+put the neutral convention in core so modules can depend on it without depending
+on Coro, and let perl own the contract.
+
+**Portability: on Windows, offload — not the bracket.** The transparent
+release/acquire bracket works by *migrating the interpreter across OS threads* —
+the blocking call stays put while a worker thread picks up the interpreter and
+resumes other coros. On Unix that is fine; on Windows it is not realistically
+fixable. Two things stand in the way: Windows emulates `fork` by cloning an
+interpreter onto another thread in the *same* address space, which by itself
+collides with a multicore worker pool; and, more fundamentally, Windows ties a
+running call's execution state to the OS thread it started on, so a coroutine
+cannot safely resume on a different thread than it suspended on. Marc Lehmann's
+"win32 perls are beyond fixing" applies squarely here: transparent
+Coro::Multicore does not run on Windows and realistically cannot.
+
+The **offload** primitive is the way out, for exactly the reason given where it
+is introduced above: the interpreter never migrates, so none of these Windows
+constraints touch it, and the deeper XS restructuring it asks for is the price
+paid once for code that then runs on every platform and under both models. One
+Windows-specific point to add: since `fork` under a live worker pool is hazardous
+anyway, such a build should make Perl's emulated `fork` fail fast while multicore
+is enabled rather than let it clone into the pool. This is why the core hook is
+deliberately two-pronged — the transparent bracket where the platform allows
+interpreter migration, offload where it does not.
+
+## An honest assessment: the social obstacle
+
+The hardest part of this proposal is not technical. A clean, additive API is
+straightforward to specify and, as the accompanying implementation shows, to
+build. The real obstacle is social and historical, and it would be dishonest to
+present the plan without saying so.
+
+Green threading in Perl has long sat inside a documented, years-long friction
+between the author of Coro (and of EV, AnyEvent, and much of the surrounding
+high-performance stack) and perl5-porters. The recurring substance was backward
+compatibility: internal changes in core repeatedly broke downstream modules that
+relied on them, and the two sides drew opposite lessons — that core should treat
+such breakage as a regression to be avoided, versus that modules reaching into
+unpublished internals had taken on a risk core never promised to underwrite.
+The tone of the exchanges, on both sides, hardened the disagreement into lasting
+distrust. The practical residue is a de facto position that core would not go
+out of its way to accommodate Coro, and a matching reluctance on the Coro side to
+route its needs through the core process at all.
+
+The honest reading of the incentives *today* is that **neither party is actually
+asking for this integration**:
+
+- The Coro author, by his own public statements, does not see a core API as the
+  remedy: his position is that core should simply stop breaking things, and he
+  maintains an independent stack (his own coroutine backend, event loop, and
+  glue) precisely so as not to depend on core's follow-through. He has also
+  largely stepped back from tracking new perl releases. A plan whose success
+  depends on his sustained engagement with p5p is unlikely to find it.
+- perl5-porters, for their part, have little appetite to add APIs that expose
+  execution-state internals in order to support a design a number of porters
+  consider unsupportable in principle. There is no standing champion for it, and
+  its association with the old conflict makes it easy to decline.
+
+Both positions are understandable, and neither is wholly wrong. The porters'
+concern is legitimate: unpublished internals *are* a real maintenance hazard, and
+blessing one consumer's needs as API carries genuine long-term cost. The Coro
+author's frustration is also legitimate: he shipped working, widely used software
+and watched it broken by changes he did not initiate. The deadlock is as much
+about trust and misaligned incentives as about any line of code — which is why it
+has outlasted every purely technical rebuttal from either direction.
+
+What follows from this is not that the proposal is hopeless, but that it cannot
+lean on either party's advocacy and must be framed and carried accordingly:
+
+- **As a general capability, not "Coro support."** The API is worth having on its
+  own terms: it is not Coro-specific code but the *stackful*-switch primitive
+  itself — what constitutes a switchable execution state, and how to tear one
+  down correctly — which any stackful green-thread or continuation runtime could
+  consume, Coro being merely the one that exists today. It encodes a piece of
+  interpreter knowledge core arguably ought to own regardless of who consumes it.
+  (Its stackless counterpart is parkapi, which makes the same case on the
+  async/await side: the two are siblings, not one facility. FAA does *not* switch
+  stacks and does not use execstate — so the honest general claim here is
+  "any stackful runtime," not "async/await too.") Presented as "a stable
+  execution-state API" it stands on its merits; presented as "make core support
+  Coro" it almost certainly does not.
+- **At zero cost to the uninvolved.** Being purely additive and ABI-safe (see
+  above) is not only good engineering but the political precondition: it lets
+  porters say yes without taking on any obligation to a consumer, any change to
+  existing behaviour, or any new breakage surface.
+- **Carried by a neutral party.** The core-side work, and its upkeep across
+  releases, needs an owner who is neither re-litigating the old dispute nor
+  waiting on the other side to change posture. The knowledge encoded is Marc
+  Lehmann's and is credited as such; *carrying* it into core and keeping it
+  correct has to be someone else's standing commitment.
+
+In short: the technical case is strong and the code is small, but the proposal
+should be advanced with clear eyes — as a modest, self-justifying core facility
+that happens to rescue an important use case, owned by someone prepared to
+maintain it without waiting for a reconciliation that may never come.
+
+## Coexisting with Futures and IO::Async
+
+Publishing the state does not pick a winner between the stackful and stackless
+styles; it strengthens both, and they interoperate. A stackful coro and a
+`Future`-based, event-loop world are complementary, not rival:
+
+- Coro integrates with event loops through `Coro::AnyEvent`, so a coro that
+  "blocks" (on a semaphore, a channel, a socket) actually cedes to the underlying
+  loop and lets other work proceed; through AnyEvent this reaches any supported
+  loop, `IO::Async` included, and there is also direct Coro↔`IO::Async` bridging
+  for programs that want the loop without the AnyEvent layer.
+- Because a coro can suspend anywhere, it can **await a `Future`** by ceding until
+  the future is ready and then returning its value — giving synchronous-looking,
+  suspend-anywhere Perl code on top of an asynchronous, `Future`-returning API.
+  Conversely FAA *is* `Future`-native: `await` consumes a `Future` directly.
+
+So the same program can use `IO::Async` (or any AnyEvent loop) as its I/O engine,
+`Future`s as the currency of pending results, FAA's `async`/`await` where a
+stackless state machine is the natural shape, and Coro where suspend-anywhere
+stackful threads (or unmodified blocking-style code, or `Coro::Multicore`'s
+OS-thread offload) are wanted — all in one interpreter, all sharing memory. A
+stable core execution-state API is what lets the stackful side of that picture
+stop being a maintenance hazard.
+
+### Worked example: blocking XS as a Future, offloaded to a thread
+
+The three pieces — FAA, Coro::Multicore, and the multicore hook — compose into
+something genuinely useful: an `async sub` can consume a blocking XS call
+*asynchronously and off the interpreter thread*, without that module ever growing
+a Future-based API. A generic wrapper does it:
+
+```perl
+sub offload (&) {
+    my ($code) = @_;
+    my $f = $loop->new_future;          # a Future tied to the shared loop
+    Coro::async {
+        my @r = eval { $code->() };     # blocking, multicore-enabled XS runs here
+        $@ ? $f->fail ($@) : $f->done (@r);
+    };
+    return $f;
+}
+
+# in an async sub:
+my $rows = await offload { $sth->execute (@args); $sth->fetchall_arrayref };
+```
+
+The spawned coro runs the blocking call; because a multicore-enabled module
+brackets its blocking section with `perlinterp_release`/`perlinterp_acquire`,
+Coro::Multicore migrates that coro onto a worker OS thread, freeing the
+interpreter thread so the loop and the awaiting `async sub` keep running. When the
+call returns, the coro resolves the Future and the loop resumes the awaiter.
+
+Why this is attractive, and the one real constraint:
+
+- It avoids the *large* change (rewriting the XS to a callback/Future API) and
+  needs only the *small* one (the multicore bracket), which the multicore-enabled
+  modules already carry — so the whole set of them becomes async-consumable from
+  FAA through this single wrapper.
+- Unlike the process-pool route (`IO::Async::Function`), the offload is
+  *shared-memory*: large arguments and results pass by reference, not serialised
+  across a process boundary.
+- The constraint: the offloaded code must be genuinely thread-safe (the multicore
+  hard rule), and the program pulls in the whole Coro + Coro::Multicore stack —
+  the stackless world leaning on the stackful one to get thread offload. It is,
+  notably, the *safe* way to mix the two: the coro is used only as a migratable
+  thread running a plain blocking call, and FAA meets it at the Future — no deep
+  interleaving of the two suspension models.
+
+### Offload to a Future without Coro
+
+That wrapper uses a coro only as the thing Coro::Multicore knows how to migrate.
+The clean end state removes even that, and the core hook already provides the
+primitive it needs: `multicore_offload(work, work_arg, done, done_arg)` (above)
+runs a pure-C `work` on a worker thread and, when it finishes, runs `done` on the
+interpreter thread to marshal the result into an SV — **with no caller
+suspension**. A thin FAA backend registers a hook that creates a Future, resolves
+it from `done`'s SV, and returns it as `multicore_offload`'s value for the caller
+to `await`:
+
+```c
+/* an FAA offload backend, in outline */
+static SV *faa_offload (work, work_arg, done, done_arg) {
+    SV *f = new_future ();
+    /* enqueue work on the pool; on completion, on the interp thread:
+     *     SV *result = done (aTHX_ done_arg);   $f->done(result);            */
+    return f;                    /* multicore_offload returns the Future      */
+}
+```
+
+With an offload backend installed (a thread pool), FAA runs blocking,
+multicore-enabled XS off the interpreter thread with **no coroutine library in
+sight**: the program stays pure stackless `async`/`await` on its event loop, the
+hook carries the work to a worker and the completion resolves the Future, and the
+XS still needs only its small bracket. (With no backend, `multicore_offload` runs
+inline — correct, blocking — just like the release/acquire bracket.)
+
+That is what the neutral multicore hook ultimately points at: the *stackless*
+world getting multi-core blocking-XS on its own terms, with a stackful runtime
+being an implementation detail of *one possible* backend rather than a required
+dependency. The core-side of this is now prototyped — `multicore_offload` /
+`multicore_register_offload` exist alongside the bracket, with a thread-pool test
+backend confirming `work` runs on another OS thread and `done` on the interpreter
+thread. What remains outside core is the easy part: a real offload backend
+(a thread pool — Coro::Multicore already has one) and a small FAA adapter that
+passes a Future's completion as `done`. Coro::Multicore plus the coro wrapper
+above is the pragmatic version that works today; the offload primitive is the one
+that lets FAA use multicore without Coro at all.
+
+Not every consumer can take this path, though. See the appendix on FFI::Platypus
+for a concrete module where offload → Future dead-ends — its result delivery is
+welded to the synchronous XSUB stack — even as offload still earns its keep for
+that module by giving it Windows multicore under Coro.
+
+## Summary
+
+- A thread is an independently scheduled flow of control that shares its
+  process's memory and is cheap to manage; concurrency is intrinsic to the idea,
+  multi-core parallelism is a separate, valuable bonus.
+- Perl gets parallelism today mainly from **processes** (fork pools, and CPAN
+  frameworks over them) and, awkwardly, from **ithreads** (clone-per-thread, no
+  real sharing, discouraged); it gets cheap in-heap **concurrency** from green
+  threads — **Coro** (stackful, suspend-anywhere) and **FAA** (stackless
+  async/await).
+- FAA is not the "simpler" answer that retires Coro: it depends on the same class
+  of internals, needs a *larger* core surface (parkapi + `caller()` simulation),
+  still has no async cancellation (only the proposed `Future::With`, RT #171969,
+  which Coro's `safe_cancel` already covers), is not itself a scheduler (no
+  `cede`/`cede_slice`), forces
+  function "coloring" (`async`/`await` propagates up the whole call graph, and
+  `local` becomes `dynamically`), and gives up Coro's suspend-anywhere
+  transparency and dynamic-scope fidelity (`local`, `$_`, `wantarray`). Coro's
+  honest debits in return are tooling (no cross-coro C backtraces or clean C
+  profiling — though XS breakpoints still fire, and the Perl debugger is usable
+  if not coro-aware) and call-site
+  visibility (Coro is cooperative — the programmer controls where yielding
+  happens — but a call does not advertise whether it may `cede`, and suspension
+  cannot be forbidden in an un-checkable context such as `DESTROY`). The two are a trade —
+  stackful-transparent vs stackless-explicit — not an upgrade; core
+  should support both on one foundation, not bet that async/await syntax
+  dissolves the problem.
+- Because performance-critical Perl work lives in **XS**, the model most programs
+  want is *Pure Perl orchestrates, critical XS executes*: one interpreter, green
+  threads for I/O concurrency, process pools for coarse parallelism, and OS
+  threads carrying the heavy XS — which is exactly what `Coro::Multicore` and
+  opt-in multicore XS modules provide, and exactly the release-the-lock-in-C
+  pattern other languages already rely on.
+- The green-thread libraries are fragile only because they depend on private,
+  drifting interpreter internals. The proposal is to publish those internals as a
+  small, additive, ABI-safe core API — **execstate** (stackful) and **parkapi**
+  (stackless) — so that the fragility becomes core's well-tested responsibility
+  and green threading in Perl becomes something one can rely on.
+- The chief obstacle is social, not technical: a long history of friction has
+  left neither the Coro author nor perl5-porters advocating for this. The plan
+  must therefore stand as a general, self-justifying, zero-cost core facility —
+  not as "Coro support" — and be carried by a neutral owner willing to maintain
+  it without waiting on a reconciliation.
+
+See `Porting/execstate_api.md` for the execstate API specification and its
+implementation plan, and `Porting/savestack_suspend_api.md` for the parkapi
+specification.
+
+## Appendix: the FFI::Platypus + FAA dead end (and why offload still pays off)
+
+The *Offload to a Future without Coro* section above sketches the clean end
+state: a generic blocking-XS module hands its C work to `multicore_offload`, an
+FAA backend resolves a Future from `done`'s SV, and the stackless world gets
+multi-core blocking-XS with no coroutine in sight. Trying to realise this for
+**FFI::Platypus** — the obvious canonical consumer, since it turns *any* C
+function into a Perl sub — mapped out exactly where that path holds and where it
+dead-ends. The short version: it works for purpose-written async XS, but a
+generic *marshalling* module like FFI cannot get *transparent* FAA support from
+it — while the same offload hook still buys FFI a real win under Coro, notably on
+Windows.
+
+### Where it breaks: result delivery is bound to the synchronous XSUB frame
+
+FFI::Platypus does not so much *return* a value as *push* one. Its result
+marshalling is a large return-type switch built on `XSRETURN_UV` / `XSRETURN_IV`
+/ `XSRETURN_NV` / `XSRETURN_EMPTY` and direct `ST(0)` assignment — macros that
+set the XSUB's mortal `TARG`, write the argument stack, and `return` out of the C
+function. All three ingredients — the argument stack (`ST(n)`), the XSUB's
+`TARG`, and the C frame you return from — exist only for the duration of the
+synchronous call.
+
+That is fatal to the offload → Future model, whose whole point is that `done()`
+runs **later**, on the event loop, after the XSUB has already returned a Future.
+By then there is no stack to push onto and no frame to return from: `XSRETURN`
+cannot be used from `done()` at all. The result has to be *produced* as a plain
+`SV *` that `done()` returns, not *returned* off the stack.
+
+The scalar/void return is, on its own, fixable: factor the switch into a producer
+`SV *ffi_pl_result_to_sv(pTHX_ self, result)` that `newSV`s the value instead of
+pushing it, and have `done()` return that SV. Simple by-value-in, scalar-out
+functions would then work under FAA.
+
+### Why the general case does not recover
+
+The return value is only half of FFI's delivery. It also **writes back output
+arguments** — `int *`, arrays, in-out records — into the *caller's* `@_` SVs
+after the call, and **re-enters Perl** for custom types (type coderefs run during
+conversion). Both are bound to the caller's synchronous frame. Under Coro that
+frame is merely suspended and still present, so the write-back and re-entry just
+work when the coro resumes. Under FAA the caller's `@_` is *gone* by the time
+`done()` runs. Making it work means marshalling every caller-side SV out of the
+transient stack into a heap-allocated job with retained refcounts, performing the
+write-back and re-entry in `done()` against those retained SVs, and freeing them
+there — a deep rewrite of the call path that must get lifetime and refcounting
+exactly right, for a payoff that is *still* a **coloured** API (a distinct
+`call_async` returning a Future; `await` required).
+
+So the dead end is specific. It is not "offload cannot serve FAA"; it is that **a
+generic marshalling module whose result delivery is entangled with the
+synchronous XSUB stack cannot get *transparent* FAA support from offload.** The
+transparency the clean-end-state sketch implies never materialises for
+FFI::Platypus. What is achievable is a scoped, explicitly-async subset
+(scalar/void return, no out-params) — useful, but not the drop-in the sketch
+suggested.
+
+### What still pays off: FFI + offload under Coro, including Windows
+
+The offload hook is not wasted on FFI. Under **Coro** the same primitive gives
+FFI the *transparent* form for free: `multicore_offload` suspends the calling
+coro, runs `ffi_call` on a worker, resumes the coro to marshal the result inline
+(on the still-present frame — no `XSRETURN` problem), and the call returns the
+value directly. `$sub->(...)` stays an ordinary synchronous call while other
+coros keep running.
+
+Crucially, offload does this **where release/acquire cannot: Windows.** The
+release/acquire bracket works by *migrating the interpreter* between OS threads,
+which Coro's Windows backend does not support; offload keeps the interpreter
+pinned and moves only the C work, so a multicore FFI call runs off the
+interpreter thread on Windows too. For FFI, that portability — not the FAA story
+— is the concrete win of the offload hook.
+
+### The general lesson
+
+Offload → Future is clean for XS modules that already produce their *entire*
+result inside a `done`-style callback: pure C work in, one SV out, no dependence
+on the caller's stack (the `scramble_async` worked example is exactly this
+shape). It breaks for modules whose result delivery is welded to the synchronous
+XSUB stack — `XSRETURN`, `TARG`, output-argument write-back — of which
+FFI::Platypus is the archetype. The offload primitive therefore delivers "FAA
+multi-core without Coro" for the well-behaved case and for purpose-written async
+XS, but not universally: stack-bound result delivery, layered on top of function
+colouring, is the boundary.
