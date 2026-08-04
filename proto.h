@@ -2611,9 +2611,18 @@ PERL_CALLCONV bool
 Perl_multicore_active(void);
 #define PERL_ARGS_ASSERT_MULTICORE_ACTIVE
 
+PERL_CALLCONV SV *
+Perl_multicore_offload(pTHX_ perl_multicore_work_t work, void *work_arg, perl_multicore_done_t done, void *done_arg);
+#define PERL_ARGS_ASSERT_MULTICORE_OFFLOAD      \
+        assert(work); assert(done)
+
 PERL_CALLCONV void
 Perl_multicore_register(pTHX_ perl_multicore_hook_t release, perl_multicore_hook_t acquire);
 #define PERL_ARGS_ASSERT_MULTICORE_REGISTER
+
+PERL_CALLCONV void
+Perl_multicore_register_offload(pTHX_ perl_multicore_offload_t offload);
+#define PERL_ARGS_ASSERT_MULTICORE_REGISTER_OFFLOAD
 
 PERL_CALLCONV void
 Perl_multicore_release(pTHX);

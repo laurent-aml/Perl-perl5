@@ -1617,6 +1617,56 @@ static IV apitest_mc_acquired = 0;
 static void apitest_mc_release (void) { ++apitest_mc_released; }
 static void apitest_mc_acquire (void) { ++apitest_mc_acquired; }
 
+/* Test offload backend (perlmulticore.h multicore_offload).  work() runs on a
+ * worker thread, done() on the calling thread; the .t checks work landed on a
+ * different OS thread and done on the main one.  The work/done hooks exist in
+ * both builds so the inline (no-backend) path is exercised too; only the real
+ * thread-pool backend needs pthreads. */
+static IV apitest_off_workran = 0, apitest_off_doneran = 0;
+/* the callbacks also check the contexts they are handed: size must cover the
+ * fields they know about, and with no cancellation in play the flag is absent */
+static IV apitest_off_work_ctx_ok = 0, apitest_off_done_ctx_ok = 0;
+
+#define APITEST_OFF_WORK_CTX_OK(ctx) \
+    ((ctx) && (ctx)->size >= sizeof (perl_multicore_work_ctx) && !(ctx)->cancel)
+#define APITEST_OFF_DONE_CTX_OK(ctx) \
+    ((ctx) && (ctx)->size >= sizeof (perl_multicore_done_ctx) && !(ctx)->cancelled)
+
+#ifdef I_PTHREAD
+#  include <pthread.h>
+#  define APITEST_HAVE_PTHREAD 1
+static pthread_t apitest_off_work_tid, apitest_off_done_tid, apitest_off_main_tid;
+static void apitest_off_work (void *arg, const perl_multicore_work_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_work_tid = pthread_self (); apitest_off_work_ctx_ok = APITEST_OFF_WORK_CTX_OK(ctx); ++apitest_off_workran; }
+static SV *apitest_off_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_done_tid = pthread_self (); apitest_off_done_ctx_ok = APITEST_OFF_DONE_CTX_OK(ctx); ++apitest_off_doneran; return &PL_sv_undef; }
+struct apitest_off_job { perl_multicore_work_t work; void *arg; perl_multicore_work_ctx ctx; };
+static void *apitest_off_thread (void *p) {
+    struct apitest_off_job *j = (struct apitest_off_job *)p;
+    j->work (j->arg, &j->ctx);
+    return NULL;
+}
+/* run work on a fresh thread (join for the prototype), then done on this one and
+ * return done()'s SV as the offload's value */
+static SV *
+apitest_offload_backend (perl_multicore_work_t work, void *work_arg,
+                         perl_multicore_done_t done, void *done_arg)
+{
+    dTHX;
+    pthread_t t;
+    struct apitest_off_job job;
+    perl_multicore_done_ctx done_ctx;
+    job.work = work; job.arg = work_arg;
+    job.ctx.size = sizeof (job.ctx); job.ctx.cancel = NULL;
+    pthread_create (&t, NULL, apitest_off_thread, &job);
+    pthread_join (t, NULL);
+    done_ctx.size = sizeof (done_ctx); done_ctx.cancelled = 0;
+    return done (aTHX_ done_arg, &done_ctx);
+}
+#else
+#  define APITEST_HAVE_PTHREAD 0
+static void apitest_off_work (void *arg, const perl_multicore_work_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_work_ctx_ok = APITEST_OFF_WORK_CTX_OK(ctx); ++apitest_off_workran; }
+static SV *apitest_off_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_done_ctx_ok = APITEST_OFF_DONE_CTX_OK(ctx); ++apitest_off_doneran; return &PL_sv_undef; }
+#endif
+
 MODULE = XS::APItest            PACKAGE = XS::APItest
 
 INCLUDE: const-xs.inc
@@ -8454,6 +8504,93 @@ IV
 acquired()
     CODE:
         RETVAL = apitest_mc_acquired;
+    OUTPUT:
+        RETVAL
+
+# --- offload (multicore_offload / multicore_register_offload) --------------
+
+UV
+have_pthread()
+    CODE:
+        RETVAL = APITEST_HAVE_PTHREAD;
+    OUTPUT:
+        RETVAL
+
+void
+install_offload()
+    CODE:
+        apitest_off_workran = apitest_off_doneran = 0;
+#if APITEST_HAVE_PTHREAD
+        apitest_off_main_tid = pthread_self ();
+        multicore_register_offload (apitest_offload_backend);
+#endif
+
+void
+uninstall_offload()
+    CODE:
+        multicore_register_offload (NULL);
+
+UV
+offload_active()
+    CODE:
+        RETVAL = perlmulticore_offload_active () ? 1 : 0;
+    OUTPUT:
+        RETVAL
+
+# run a pure-C job through the offload primitive (backend if installed, else
+# inline); multicore_offload now returns the backend's result SV, unused here.
+void
+run_offload()
+    CODE:
+        (void) multicore_offload (apitest_off_work, NULL, apitest_off_done, NULL);
+
+IV
+off_work_ctx_ok()
+    CODE:
+        RETVAL = apitest_off_work_ctx_ok;
+    OUTPUT:
+        RETVAL
+
+IV
+off_done_ctx_ok()
+    CODE:
+        RETVAL = apitest_off_done_ctx_ok;
+    OUTPUT:
+        RETVAL
+
+IV
+off_workran()
+    CODE:
+        RETVAL = apitest_off_workran;
+    OUTPUT:
+        RETVAL
+
+IV
+off_doneran()
+    CODE:
+        RETVAL = apitest_off_doneran;
+    OUTPUT:
+        RETVAL
+
+UV
+work_ran_off_thread()
+    CODE:
+#if APITEST_HAVE_PTHREAD
+        RETVAL = !pthread_equal (apitest_off_work_tid, apitest_off_main_tid);
+#else
+        RETVAL = 0;
+#endif
+    OUTPUT:
+        RETVAL
+
+UV
+done_ran_on_main()
+    CODE:
+#if APITEST_HAVE_PTHREAD
+        RETVAL = pthread_equal (apitest_off_done_tid, apitest_off_main_tid) ? 1 : 0;
+#else
+        RETVAL = 1;
+#endif
     OUTPUT:
         RETVAL
 

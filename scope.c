@@ -2114,6 +2114,70 @@ Perl_multicore_register(pTHX_ perl_multicore_hook_t release,
     PL_multicore_api->pmapi_acquire = acquire ? acquire : S_multicore_nop;
 }
 
+/*
+=for apidoc multicore_offload
+
+Hand a blocking/CPU-bound C section to a worker thread while the interpreter
+stays on its thread.  C<work(work_arg)> is pure C and must not touch the
+interpreter; when it finishes, C<done(done_arg)> runs on the interpreter thread
+and returns the result marshalled into an SV.  The return value is whatever the
+registered backend produces: a stackful (Coro) backend suspends the calling
+green thread and resumes it to run C<done>, returning the value directly (the
+call looks synchronous); a stackless (Future::AsyncAwait) backend returns a
+Future that C<done> resolves.  This is the dual of the
+C<perlinterp_release>/C<perlinterp_acquire> bracket - it never migrates the
+interpreter, so it works where the bracket cannot (notably Windows).  With no
+offload backend installed it runs C<work> then C<done> inline and returns
+C<done>'s SV (blocking, but correct).  B<Experimental.>
+
+=cut
+*/
+
+SV *
+Perl_multicore_offload(pTHX_ perl_multicore_work_t work, void *work_arg,
+                             perl_multicore_done_t done, void *done_arg)
+{
+    PERL_ARGS_ASSERT_MULTICORE_OFFLOAD;
+
+    if (PL_multicore_offload)
+        return PL_multicore_offload(work, work_arg, done, done_arg);
+
+    /* no backend: run inline (blocking) and marshal the result here.  The
+     * contexts are still supplied, so a module never has to special-case the
+     * backendless path: no cancellation is possible here, hence a NULL flag. */
+    {
+        perl_multicore_work_ctx work_ctx;
+        perl_multicore_done_ctx done_ctx;
+
+        work_ctx.size   = sizeof(perl_multicore_work_ctx);
+        work_ctx.cancel = NULL;
+
+        work(work_arg, &work_ctx);
+
+        done_ctx.size      = sizeof(perl_multicore_done_ctx);
+        done_ctx.cancelled = 0;
+
+        return done(aTHX_ done_arg, &done_ctx);
+    }
+}
+
+/*
+=for apidoc multicore_register_offload
+
+Install (or, with C<NULL>, remove) the offload backend that L</C<multicore_offload>>
+dispatches to.  A backend that owns a worker-thread pool - such as one that also
+registers the release/acquire bracket - can provide both.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_multicore_register_offload(pTHX_ perl_multicore_offload_t offload)
+{
+    PERL_UNUSED_CONTEXT;
+    PL_multicore_offload = offload;
+}
+
 void
 Perl_cx_dump(pTHX_ PERL_CONTEXT *cx)
 {

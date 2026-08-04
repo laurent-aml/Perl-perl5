@@ -2076,9 +2076,16 @@ EXp	|SV *	|multiconcat_stringify					\
 : multicore hook ("Perl Multicore Specification") - see perlmulticore.h
 ATdp	|void	|multicore_acquire
 ATdp	|bool	|multicore_active
+Adp	|SV *	|multicore_offload					\
+				|NN perl_multicore_work_t work		\
+				|NULLOK void *work_arg			\
+				|NN perl_multicore_done_t done		\
+				|NULLOK void *done_arg
 Adp	|void	|multicore_register					\
 				|NULLOK perl_multicore_hook_t release	\
 				|NULLOK perl_multicore_hook_t acquire
+Adp	|void	|multicore_register_offload					\
+				|NULLOK perl_multicore_offload_t offload
 Adp	|void	|multicore_release
 EXp	|SV *	|multideref_stringify					\
 				|NN const OP *o 			\

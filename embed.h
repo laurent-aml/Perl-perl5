@@ -382,7 +382,9 @@
 # define msbit_pos32                            Perl_msbit_pos32
 # define multicore_acquire                      Perl_multicore_acquire
 # define multicore_active                       Perl_multicore_active
+# define multicore_offload(a,b,c,d)             Perl_multicore_offload(aTHX_ a,b,c,d)
 # define multicore_register(a,b)                Perl_multicore_register(aTHX_ a,b)
+# define multicore_register_offload(a)          Perl_multicore_register_offload(aTHX_ a)
 # define multicore_release()                    Perl_multicore_release(aTHX)
 # define my_atof(a)                             Perl_my_atof(aTHX_ a)
 # define my_atof3(a,b,c)                        Perl_my_atof3(aTHX_ a,b,c)
