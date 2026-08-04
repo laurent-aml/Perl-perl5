@@ -380,6 +380,10 @@
 # define mro_get_linear_isa(a)                  Perl_mro_get_linear_isa(aTHX_ a)
 # define mro_method_changed_in(a)               Perl_mro_method_changed_in(aTHX_ a)
 # define msbit_pos32                            Perl_msbit_pos32
+# define multicore_acquire                      Perl_multicore_acquire
+# define multicore_active                       Perl_multicore_active
+# define multicore_register(a,b)                Perl_multicore_register(aTHX_ a,b)
+# define multicore_release()                    Perl_multicore_release(aTHX)
 # define my_atof(a)                             Perl_my_atof(aTHX_ a)
 # define my_atof3(a,b,c)                        Perl_my_atof3(aTHX_ a,b,c)
 # define my_dirfd                               Perl_my_dirfd

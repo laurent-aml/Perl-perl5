@@ -2073,6 +2073,13 @@ Adhop	|SV *	|mro_set_private_data					\
 CRTip	|unsigned|msbit_pos32	|U32 word
 EXp	|SV *	|multiconcat_stringify					\
 				|NN const OP *o
+: multicore hook ("Perl Multicore Specification") - see perlmulticore.h
+ATdp	|void	|multicore_acquire
+ATdp	|bool	|multicore_active
+Adp	|void	|multicore_register					\
+				|NULLOK perl_multicore_hook_t release	\
+				|NULLOK perl_multicore_hook_t acquire
+Adp	|void	|multicore_release
 EXp	|SV *	|multideref_stringify					\
 				|NN const OP *o 			\
 				|NULLOK CV *cv

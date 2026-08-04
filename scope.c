@@ -26,6 +26,7 @@
 #define PERL_IN_SCOPE_C
 #include "perl.h"
 #include "feature.h"
+#include "perlmulticore.h"     /* full hook API: struct body + Perl_multicore_* */
 
 SV**
 Perl_stack_grow(pTHX_ SV **sp, SV **p, SSize_t n)
@@ -2006,6 +2007,111 @@ Perl_execstate_topenv_root(pTHX)
         te = te->je_prev;
 
     return te;
+}
+
+/* ------------------------------------------------------------------------- *
+ * multicore hook - see perlmulticore.h.  Wire-compatible with the deployed
+ * CPAN perlmulticore.h: the two hooks live in a struct in PL_modglobal under
+ * "perl_multicore_api", and PL_multicore_api caches a pointer to it.
+ * ------------------------------------------------------------------------- */
+
+static void S_multicore_nop(void) { }
+
+#define PERL_MULTICORE_API_KEY "perl_multicore_api"
+
+/* fetch (or create, with nop hooks) the shared struct and cache it */
+static void
+S_multicore_init(pTHX)
+{
+    SV **svp = hv_fetch(PL_modglobal, PERL_MULTICORE_API_KEY,
+                        sizeof(PERL_MULTICORE_API_KEY) - 1, 1);
+
+    if (SvPOKp(*svp))
+        PL_multicore_api = (struct perl_multicore_api *)SvPVX(*svp);
+    else {
+        SV *sv = newSV(sizeof(struct perl_multicore_api));
+        SvCUR_set(sv, sizeof(struct perl_multicore_api));
+        SvPOK_only(sv);
+        PL_multicore_api = (struct perl_multicore_api *)SvPVX(sv);
+        PL_multicore_api->pmapi_release = S_multicore_nop;
+        PL_multicore_api->pmapi_acquire = S_multicore_nop;
+        *svp = sv;
+    }
+}
+
+/*
+=for apidoc multicore_release
+
+Release the interpreter around a blocking or CPU-bound C section, as the
+C<perlinterp_release> half of the multicore bracket (see F<perlmulticore.h>).
+A no-op unless a backend is installed.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_multicore_release(pTHX)
+{
+    if (!PL_multicore_api)
+        S_multicore_init(aTHX);
+
+    PL_multicore_api->pmapi_release();
+}
+
+/*
+=for apidoc multicore_acquire
+
+Re-acquire the interpreter, the C<perlinterp_acquire> half of the multicore
+bracket.  Context-free, as it may run on a worker thread; must follow a
+C<perlinterp_release>.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_multicore_acquire(void)
+{
+    if (PL_multicore_api)
+        PL_multicore_api->pmapi_acquire();
+}
+
+/*
+=for apidoc multicore_active
+
+True if a multicore backend (other than the built-in no-op) is installed.
+B<Experimental.>
+
+=cut
+*/
+
+bool
+Perl_multicore_active(void)
+{
+    return PL_multicore_api && PL_multicore_api->pmapi_release != S_multicore_nop;
+}
+
+/*
+=for apidoc multicore_register
+
+Install (or, with C<NULL> arguments, remove) the multicore backend hooks that
+C<perlinterp_release> / C<perlinterp_acquire> call.  Writes the shared struct in
+C<PL_modglobal>, so this drives modules built against either core's header or a
+bundled CPAN F<perlmulticore.h>.  A cooperative-scheduling backend registers
+hooks that move the running thread onto a worker OS thread for the duration.
+B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_multicore_register(pTHX_ perl_multicore_hook_t release,
+                              perl_multicore_hook_t acquire)
+{
+    if (!PL_multicore_api)
+        S_multicore_init(aTHX);
+
+    PL_multicore_api->pmapi_release = release ? release : S_multicore_nop;
+    PL_multicore_api->pmapi_acquire = acquire ? acquire : S_multicore_nop;
 }
 
 void
