@@ -3924,10 +3924,45 @@ Perl_multicore_active(pTHX)
 #define PERL_ARGS_ASSERT_MULTICORE_ACTIVE       \
         Perl_assert_aTHX
 
+PERL_CALLCONV SV *
+Perl_multicore_offload(pTHX_ perl_multicore_work_t work, void *work_arg, perl_multicore_done_t done, void *done_arg)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1)
+        Perl_attribute_nonnull(pTHX_3);
+#define PERL_ARGS_ASSERT_MULTICORE_OFFLOAD      \
+        Perl_assert_aTHX; assert(work); assert(done)
+
+PERL_CALLCONV SV *
+Perl_multicore_offload_cancelled(pTHX_ SV *partial, const char *message)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_MULTICORE_OFFLOAD_CANCELLED \
+        Perl_assert_aTHX
+
+PERL_CALLCONV SV *
+Perl_multicore_offload_ready(pTHX_ SV *value)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1);
+#define PERL_ARGS_ASSERT_MULTICORE_OFFLOAD_READY \
+        Perl_assert_aTHX; assert(value)
+
+PERL_CALLCONV SV *
+Perl_multicore_offload_sync(pTHX_ perl_multicore_work_t work, void *work_arg, perl_multicore_done_t done, void *done_arg)
+        Perl_attribute_nonnull_aTHX
+        Perl_attribute_nonnull(pTHX_1)
+        Perl_attribute_nonnull(pTHX_3);
+#define PERL_ARGS_ASSERT_MULTICORE_OFFLOAD_SYNC \
+        Perl_assert_aTHX; assert(work); assert(done)
+
 PERL_CALLCONV void
 Perl_multicore_register(pTHX_ perl_multicore_hook_t release, perl_multicore_hook_t acquire)
         Perl_attribute_nonnull_aTHX;
 #define PERL_ARGS_ASSERT_MULTICORE_REGISTER     \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_multicore_register_offload(pTHX_ perl_multicore_offload_t offload)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_MULTICORE_REGISTER_OFFLOAD \
         Perl_assert_aTHX
 
 PERL_CALLCONV void
