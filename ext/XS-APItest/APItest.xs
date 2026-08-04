@@ -9,6 +9,7 @@
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
+#include "perlmulticore.h"   /* multicore hook API (perl.h now exposes only its types) */
 
 /* PERL_VERSION_xx sanity checks */
 #if !PERL_VERSION_EQ(PERL_VERSION_MAJOR, PERL_VERSION_MINOR, PERL_VERSION_PATCH)
@@ -1606,6 +1607,15 @@ destruct_test(pTHX_ void *p) {
 #else
 #  define hwm_checks_enabled() false
 #endif
+
+/* A trivial test backend for the core multicore hook (perlmulticore.h): the
+ * release/acquire hooks just count calls, so a test can confirm the
+ * perlinterp_release/acquire bracket fires in pairs.  A real backend such as
+ * Coro::Multicore would migrate the running thread onto a worker OS thread. */
+static IV apitest_mc_released = 0;
+static IV apitest_mc_acquired = 0;
+static void apitest_mc_release (void) { ++apitest_mc_released; }
+static void apitest_mc_acquire (void) { ++apitest_mc_acquired; }
 
 MODULE = XS::APItest            PACKAGE = XS::APItest
 
@@ -8371,6 +8381,79 @@ jmpenv_ok()
 
         RETVAL = ok;
     }
+    OUTPUT:
+        RETVAL
+
+MODULE = XS::APItest            PACKAGE = XS::APItest::multicore
+
+void
+install()
+    CODE:
+        apitest_mc_released = apitest_mc_acquired = 0;
+        multicore_register (apitest_mc_release, apitest_mc_acquire);
+
+# Install a backend the way the deployed CPAN backends (Coro::Multicore) do -
+# by writing the shared PL_modglobal struct directly, WITHOUT the core
+# multicore_register API.  If core's perlinterp_release/acquire then drive it,
+# core is wire-compatible with the existing ecosystem.
+void
+install_via_modglobal()
+    CODE:
+    {
+        SV **svp = hv_fetch (PL_modglobal, "perl_multicore_api",
+                             sizeof ("perl_multicore_api") - 1, 1);
+        struct perl_multicore_api *api;
+        apitest_mc_released = apitest_mc_acquired = 0;
+        if (!SvPOKp (*svp)) {
+            SV *sv = newSV (sizeof (struct perl_multicore_api));
+            SvCUR_set (sv, sizeof (struct perl_multicore_api));
+            SvPOK_only (sv);
+            *svp = sv;
+        }
+        api = (struct perl_multicore_api *)SvPVX (*svp);
+        api->pmapi_release = apitest_mc_release;
+        api->pmapi_acquire = apitest_mc_acquire;
+    }
+
+void
+uninstall()
+    CODE:
+        multicore_register (NULL, NULL);
+
+UV
+active()
+    CODE:
+        RETVAL = perlmulticore_active () ? 1 : 0;
+    OUTPUT:
+        RETVAL
+
+# bracket a pure-C section (no perl API between release and acquire) and return
+# its result; sum of 0..999 == 499500
+UV
+run_blocking()
+    CODE:
+    {
+        volatile UV i, sum = 0;
+        perlinterp_release ();
+        for (i = 0; i < 1000; ++i)
+            sum += i;
+        perlinterp_acquire ();
+        RETVAL = sum;
+    }
+    OUTPUT:
+        RETVAL
+
+IV
+released()
+    CODE:
+        RETVAL = apitest_mc_released;
+    OUTPUT:
+        RETVAL
+
+IV
+acquired()
+    CODE:
+        RETVAL = apitest_mc_acquired;
     OUTPUT:
         RETVAL
 

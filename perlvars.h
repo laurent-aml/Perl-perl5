@@ -90,6 +90,13 @@ PERLVARI(G, csighandlerp,  Sighandler_t,  Perl_csighandler)
 PERLVARI(G, csighandler1p, Sighandler1_t, Perl_csighandler1)
 PERLVARI(G, csighandler3p, Sighandler3_t, Perl_csighandler3)
 
+/* multicore (perlmulticore.h): process-global cached pointer to the shared
+ * release/acquire hook struct in PL_modglobal["perl_multicore_api"]; NULL until
+ * first touched.  Global (not per-interpreter) so acquire() is reachable from a
+ * worker thread with no interpreter context - matching the CPAN header's model,
+ * with the same single-main-interpreter caveat under ithreads. */
+PERLVARI(G, multicore_api, struct perl_multicore_api *, NULL)
+
 /* This is constant on most architectures, a global on OS/2 */
 #ifdef OS2
 PERLVARI(G, sh_path,	char *, SH_PATH) /* full path of shell */
