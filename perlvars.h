@@ -96,6 +96,8 @@ PERLVARI(G, csighandler3p, Sighandler3_t, Perl_csighandler3)
  * worker thread with no interpreter context - matching the CPAN header's model,
  * with the same single-main-interpreter caveat under ithreads. */
 PERLVARI(G, multicore_api, struct perl_multicore_api *, NULL)
+/* the offload backend hook (perlmulticore.h), NULL = none (inline fallback) */
+PERLVARI(G, multicore_offload, perl_multicore_offload_t, NULL)
 
 /* This is constant on most architectures, a global on OS/2 */
 #ifdef OS2

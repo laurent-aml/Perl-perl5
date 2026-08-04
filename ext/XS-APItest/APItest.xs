@@ -1617,6 +1617,178 @@ static IV apitest_mc_acquired = 0;
 static void apitest_mc_release (void) { ++apitest_mc_released; }
 static void apitest_mc_acquire (void) { ++apitest_mc_acquired; }
 
+/* Test offload backend (perlmulticore.h multicore_offload).  work() runs on a
+ * worker thread, done() on the calling thread; the .t checks work landed on a
+ * different OS thread and done on the main one.  The work/done hooks exist in
+ * both builds so the inline (no-backend) path is exercised too; only the real
+ * thread-pool backend needs pthreads. */
+static IV apitest_off_workran = 0, apitest_off_doneran = 0;
+/* the callbacks also check the contexts they are handed: size must cover the
+ * fields they know about, and with no cancellation in play the flag is absent */
+static IV apitest_off_work_ctx_ok = 0, apitest_off_done_ctx_ok = 0;
+
+#define APITEST_OFF_WORK_CTX_OK(ctx) \
+    ((ctx) && (ctx)->size >= sizeof (perl_multicore_work_ctx) && !(ctx)->cancel)
+#define APITEST_OFF_DONE_CTX_OK(ctx) \
+    ((ctx) && (ctx)->size >= sizeof (perl_multicore_done_ctx) && !(ctx)->cancelled)
+
+/* a done () that reports failure the sanctioned way, for the failure path */
+static SV *
+apitest_off_croak_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx)
+{
+    PERL_UNUSED_ARG(arg);
+    PERL_UNUSED_ARG(ctx);
+    croak ("apitest offload: deliberate croak from done ()");
+}
+
+/* a done () that stopped early and says so the sanctioned way: raise, with what it
+ * salvaged reachable from the exception.  Returning a truncated result that the
+ * caller could not tell apart from a whole one is what this exists to avoid. */
+static SV *
+apitest_off_partial_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx)
+{
+    PERL_UNUSED_ARG(arg);
+    PERL_UNUSED_ARG(ctx);
+
+    croak_sv (multicore_offload_cancelled (newSVpvs ("chunks=3"),
+                                           "apitest offload: stopped early"));
+}
+
+#ifdef I_PTHREAD
+#  include <pthread.h>
+#  define APITEST_HAVE_PTHREAD 1
+static pthread_t apitest_off_work_tid, apitest_off_done_tid, apitest_off_main_tid;
+static void apitest_off_work (void *arg, const perl_multicore_work_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_work_tid = pthread_self (); apitest_off_work_ctx_ok = APITEST_OFF_WORK_CTX_OK(ctx); ++apitest_off_workran; }
+static SV *apitest_off_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_done_tid = pthread_self (); apitest_off_done_ctx_ok = APITEST_OFF_DONE_CTX_OK(ctx); ++apitest_off_doneran; return &PL_sv_undef; }
+struct apitest_off_job { perl_multicore_work_t work; void *arg; perl_multicore_work_ctx ctx; };
+static void *apitest_off_thread (void *p) {
+    struct apitest_off_job *j = (struct apitest_off_job *)p;
+    j->work (j->arg, &j->ctx);
+    return NULL;
+}
+/* Run work on a fresh thread (join for the prototype), then done on this one, and
+ * hand back an already-resolved handle wrapping its SV.  Resolving before
+ * returning is what makes this a two-line backend - it needs no handle class of
+ * its own - and the contract permits it: a consumer cannot tell, since `get` on a
+ * resolved handle returns at once. */
+static SV *
+apitest_offload_backend (perl_multicore_work_t work, void *work_arg,
+                         perl_multicore_done_t done, void *done_arg)
+{
+    dTHX;
+    pthread_t t;
+    struct apitest_off_job job;
+    perl_multicore_done_ctx done_ctx;
+    job.work = work; job.arg = work_arg;
+    job.ctx.size = sizeof (job.ctx); job.ctx.cancel = NULL;
+    pthread_create (&t, NULL, apitest_off_thread, &job);
+    pthread_join (t, NULL);
+    done_ctx.size = sizeof (done_ctx); done_ctx.cancelled = 0; done_ctx.dropped = 0;
+    return multicore_offload_ready (done (aTHX_ done_arg, &done_ctx));
+}
+
+/* A second test backend, shaped like a STACKLESS one: it does not wait.  The
+ * work is started, a PENDING handle of a caller-chosen class is returned, and
+ * nothing else happens until offload_tick () joins the worker, runs done () and
+ * resolves the handle - which is what a Future::AsyncAwait backend does on its
+ * event loop, minus the loop.
+ *
+ * The class is chosen by the test so that the same backend can hand back core's
+ * PerlMulticore::Handle and a plain Future, which implements the same AWAIT_*
+ * protocol.  That the contract is really duck-typed is the claim being tested.
+ *
+ * One job in flight is enough here.  done () is run through an eval, because a
+ * croak from it has nowhere to go but the handle: for a deferred backend the
+ * caller's frame is long gone. */
+static SV *apitest_off_handle = NULL;         /* the pending handle, if any */
+static perl_multicore_done_t apitest_off_done_fn;
+static void *apitest_off_done_arg;
+static pthread_t apitest_off_deferred_tid;
+static char apitest_off_handle_class[64] = "PerlMulticore::Handle";
+static struct apitest_off_job apitest_off_deferred_job;
+
+static SV *
+apitest_offload_deferred (perl_multicore_work_t work, void *work_arg,
+                          perl_multicore_done_t done, void *done_arg)
+{
+    dTHX;
+    SV *handle;
+    dSP;
+
+    if (apitest_off_handle)
+        croak ("apitest deferred offload: one at a time");
+
+    apitest_off_deferred_job.work = work;
+    apitest_off_deferred_job.arg  = work_arg;
+    apitest_off_deferred_job.ctx.size   = sizeof (apitest_off_deferred_job.ctx);
+    apitest_off_deferred_job.ctx.cancel = NULL;
+
+    apitest_off_done_fn  = done;
+    apitest_off_done_arg = done_arg;
+
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    XPUSHs(newSVpv(apitest_off_handle_class, 0));
+    PUTBACK;
+    call_method("new", G_SCALAR);
+    SPAGAIN;
+    handle = SvREFCNT_inc_NN(POPs);
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+
+    apitest_off_handle = SvREFCNT_inc_NN(handle);   /* ours, to resolve later */
+
+    pthread_create (&apitest_off_deferred_tid, NULL, apitest_off_thread,
+                    &apitest_off_deferred_job);
+
+    return handle;                                  /* pending: nothing waited */
+}
+
+/* join the worker, run done (), resolve the handle.  Returns whether there was
+ * anything to do. */
+static int
+apitest_offload_tick (pTHX)
+{
+    SV *handle = apitest_off_handle;
+    SV *value;
+    const char *method;
+    dSP;
+
+    if (!handle)
+        return 0;
+
+    pthread_join (apitest_off_deferred_tid, NULL);
+    apitest_off_handle = NULL;
+
+    /* the module's failure channel is a croak from done (), which for a deferred
+     * backend must become the handle's failure rather than an exception here */
+    value  = eval_pv ("XS::APItest::multicore::_offload_run_done ()", 0);
+    method = SvTRUE (ERRSV) ? "AWAIT_FAIL" : "AWAIT_DONE";
+
+    ENTER;
+    SAVETMPS;
+    PUSHMARK(SP);
+    EXTEND(SP, 2);
+    PUSHs(handle);
+    PUSHs(SvTRUE (ERRSV) ? sv_mortalcopy (ERRSV) : value);
+    PUTBACK;
+    call_method(method, G_VOID | G_DISCARD);
+    FREETMPS;
+    LEAVE;
+
+    SvREFCNT_dec (handle);
+
+    return 1;
+}
+
+#else
+#  define APITEST_HAVE_PTHREAD 0
+static void apitest_off_work (void *arg, const perl_multicore_work_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_work_ctx_ok = APITEST_OFF_WORK_CTX_OK(ctx); ++apitest_off_workran; }
+static SV *apitest_off_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx) { PERL_UNUSED_ARG(arg); apitest_off_done_ctx_ok = APITEST_OFF_DONE_CTX_OK(ctx); ++apitest_off_doneran; return &PL_sv_undef; }
+#endif
+
 MODULE = XS::APItest            PACKAGE = XS::APItest
 
 INCLUDE: const-xs.inc
@@ -8454,6 +8626,185 @@ IV
 acquired()
     CODE:
         RETVAL = apitest_mc_acquired;
+    OUTPUT:
+        RETVAL
+
+# --- offload (multicore_offload / multicore_register_offload) --------------
+
+UV
+have_pthread()
+    CODE:
+        RETVAL = APITEST_HAVE_PTHREAD;
+    OUTPUT:
+        RETVAL
+
+void
+install_offload()
+    CODE:
+        apitest_off_workran = apitest_off_doneran = 0;
+#if APITEST_HAVE_PTHREAD
+        apitest_off_main_tid = pthread_self ();
+        multicore_register_offload (apitest_offload_backend);
+#endif
+
+void
+uninstall_offload()
+    CODE:
+        multicore_register_offload (NULL);
+
+UV
+offload_active()
+    CODE:
+        RETVAL = perlmulticore_offload_active () ? 1 : 0;
+    OUTPUT:
+        RETVAL
+
+# Run a pure-C job through the offload primitive (backend if installed, else
+# inline).  The synchronous form: it waits for the handle and hands back done()'s
+# value, which is what a module whose entry point returns a value wants, and the
+# path that keeps its job on this frame.
+SV *
+run_offload()
+    CODE:
+        RETVAL = multicore_offload_sync (apitest_off_work, NULL,
+                                         apitest_off_done, NULL);
+    OUTPUT:
+        RETVAL
+
+# The other form: hand back the handle itself, which is what a module offering an
+# asynchronous entry point does.  Nothing on this frame is passed to the work, so
+# there is nothing here that has to outlive the call.
+SV *
+run_offload_async()
+    CODE:
+        RETVAL = multicore_offload (apitest_off_work, NULL,
+                                    apitest_off_done, NULL);
+    OUTPUT:
+        RETVAL
+
+# A value that never went near a worker, wrapped so that it can be returned where
+# a handle is expected.
+SV *
+offload_ready(SV *value)
+    CODE:
+        RETVAL = multicore_offload_ready (newSVsv (value));
+    OUTPUT:
+        RETVAL
+
+# --- the deferred (stackless-shaped) test backend --------------------------
+
+void
+install_offload_deferred(const char *class)
+    CODE:
+#if APITEST_HAVE_PTHREAD
+        apitest_off_workran = apitest_off_doneran = 0;
+        apitest_off_main_tid = pthread_self ();
+        if (strlen (class) >= sizeof (apitest_off_handle_class))
+            croak ("class name too long");
+        strcpy (apitest_off_handle_class, class);
+        multicore_register_offload (apitest_offload_deferred);
+#else
+        PERL_UNUSED_ARG(class);
+#endif
+
+# Join the worker, run done (), resolve the handle: what a stackless backend
+# would do from its event loop.
+UV
+offload_tick()
+    CODE:
+#if APITEST_HAVE_PTHREAD
+        RETVAL = apitest_offload_tick (aTHX);
+#else
+        RETVAL = 0;
+#endif
+    OUTPUT:
+        RETVAL
+
+# Only for offload_tick () to call, through an eval: running done () is where a
+# module reports failure by croaking.
+SV *
+_offload_run_done()
+    CODE:
+#if APITEST_HAVE_PTHREAD
+{
+        perl_multicore_done_ctx done_ctx;
+        done_ctx.size = sizeof (done_ctx);
+        done_ctx.cancelled = 0;
+        done_ctx.dropped = 0;
+        RETVAL = apitest_off_done_fn (aTHX_ apitest_off_done_arg, &done_ctx);
+}
+#else
+        RETVAL = &PL_sv_undef;
+#endif
+    OUTPUT:
+        RETVAL
+
+# A done () that croaks, for the failure path.
+SV *
+run_offload_croaking_async()
+    CODE:
+        RETVAL = multicore_offload (apitest_off_work, NULL,
+                                    apitest_off_croak_done, NULL);
+    OUTPUT:
+        RETVAL
+
+# A done () that stopped early: raises PerlMulticore::Cancelled with the partial
+# result attached.
+SV *
+run_offload_partial_async()
+    CODE:
+        RETVAL = multicore_offload (apitest_off_work, NULL,
+                                    apitest_off_partial_done, NULL);
+    OUTPUT:
+        RETVAL
+
+IV
+off_work_ctx_ok()
+    CODE:
+        RETVAL = apitest_off_work_ctx_ok;
+    OUTPUT:
+        RETVAL
+
+IV
+off_done_ctx_ok()
+    CODE:
+        RETVAL = apitest_off_done_ctx_ok;
+    OUTPUT:
+        RETVAL
+
+IV
+off_workran()
+    CODE:
+        RETVAL = apitest_off_workran;
+    OUTPUT:
+        RETVAL
+
+IV
+off_doneran()
+    CODE:
+        RETVAL = apitest_off_doneran;
+    OUTPUT:
+        RETVAL
+
+UV
+work_ran_off_thread()
+    CODE:
+#if APITEST_HAVE_PTHREAD
+        RETVAL = !pthread_equal (apitest_off_work_tid, apitest_off_main_tid);
+#else
+        RETVAL = 0;
+#endif
+    OUTPUT:
+        RETVAL
+
+UV
+done_ran_on_main()
+    CODE:
+#if APITEST_HAVE_PTHREAD
+        RETVAL = pthread_equal (apitest_off_done_tid, apitest_off_main_tid) ? 1 : 0;
+#else
+        RETVAL = 1;
+#endif
     OUTPUT:
         RETVAL
 

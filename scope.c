@@ -2121,6 +2121,291 @@ Perl_multicore_register(pTHX_ perl_multicore_hook_t release,
     PL_multicore_api->pmapi_acquire = acquire ? acquire : S_multicore_nop;
 }
 
+/*
+=for apidoc multicore_offload_cancelled
+
+Build the exception a module's C<done> raises when it was asked to stop early and
+the result it would have produced is incomplete:
+
+    if (ctx->cancelled && j->stopped_early)
+        croak_sv(multicore_offload_cancelled(partial, NULL));
+
+Returns a mortal C<PerlMulticore::Cancelled> (see L<PerlMulticore>), to hand straight to
+C<croak_sv>.  C<partial> is whatever the module salvaged, or C<NULL> if it kept
+nothing; it is consumed.  C<message> may be C<NULL> for the default.
+
+Raising rather than returning matters because a truncated result the caller cannot
+tell apart from a whole one is the worst outcome available, and the caller that
+awaits an offload is often not the one that cancelled it.  It has to be C<done> that
+decides: C<done_ctx.cancelled> says cancellation was I<requested>, and a C<work> on
+its last chunk may have finished complete anyway - which only the module can know.
+
+If the class cannot be loaded, a plain string exception SV is returned instead, so
+the failure still reaches the caller.  B<Experimental.>
+
+=cut
+*/
+
+SV *
+Perl_multicore_offload_cancelled(pTHX_ SV *partial, const char *message)
+{
+    SV *err;
+    SSize_t count;
+    dSP;
+
+    if (!message)
+        message = "offload cancelled";
+
+    if (!get_cvs("PerlMulticore::Cancelled::new", 0))
+        require_pv("PerlMulticore.pm");
+
+    if (!get_cvs("PerlMulticore::Cancelled::new", 0)) {
+        SvREFCNT_dec(partial);
+        return sv_2mortal(newSVpvf("%s\n", message));
+    }
+
+    ENTER;
+    SAVETMPS;
+
+    SPAGAIN;
+    PUSHMARK(SP);
+    EXTEND(SP, 5);
+    PUSHs(newSVpvs_flags("PerlMulticore::Cancelled", SVs_TEMP));
+    PUSHs(newSVpvs_flags("message", SVs_TEMP));
+    PUSHs(sv_2mortal(newSVpv(message, 0)));
+    PUSHs(newSVpvs_flags("partial", SVs_TEMP));
+    PUSHs(partial ? sv_2mortal(partial) : &PL_sv_undef);
+    PUTBACK;
+
+    count = call_method("new", G_SCALAR | G_EVAL);
+
+    SPAGAIN;
+    err = count >= 1 && !SvTRUE(ERRSV) ? SvREFCNT_inc_NN(*SP)
+                                       : newSVpvf("%s\n", message);
+    SP -= count;
+    PUTBACK;
+
+    FREETMPS;
+    LEAVE;
+
+    return sv_2mortal(err);
+}
+
+/*
+=for apidoc multicore_offload_ready
+
+Wrap a value that is already known in an already-resolved offload handle, so that
+it can be returned where L</C<multicore_offload>>'s handle is expected.  Two
+callers need this: an offload backend that finishes the work before it returns,
+and a module whose asynchronous entry point sometimes has the answer without
+offloading at all - a cached result, or an input too small to be worth a worker.
+Both must hand back the same shape as an offload that really was deferred.
+
+C<value> is consumed: pass a reference with refcount 1, exactly as C<done> hands
+one over.  The handle comes back with refcount 1 in turn.
+
+The class is C<PerlMulticore::Handle> (see L<PerlMulticore>), loaded on demand.  If it cannot be loaded -
+a partial installation, or an embedded perl without the library - C<value> is
+returned bare rather than the call failing, since losing the inline path to a
+missing module would be worse than the shape being wrong on a perl that is
+already broken.  B<Experimental.>
+
+=cut
+*/
+
+SV *
+Perl_multicore_offload_ready(pTHX_ SV *value)
+{
+    SV *handle;
+    dSP;
+
+    PERL_ARGS_ASSERT_MULTICORE_OFFLOAD_READY;
+
+    ENTER;
+    SAVETMPS;
+
+    if (!get_cvs("PerlMulticore::Handle::AWAIT_NEW_DONE", 0))
+        require_pv("PerlMulticore.pm");
+
+    SPAGAIN;
+    PUSHMARK(SP);
+    EXTEND(SP, 2);
+    PUSHs(newSVpvs_flags("PerlMulticore::Handle", SVs_TEMP));
+    PUSHs(sv_2mortal(value));
+    PUTBACK;
+
+    {
+        SSize_t count = call_method("AWAIT_NEW_DONE", G_SCALAR | G_EVAL);
+
+        SPAGAIN;
+
+        /* on a die with G_SCALAR an undef is pushed, so the count alone does not
+         * say whether the call worked */
+        handle = count >= 1 && !SvTRUE(ERRSV) ? SvREFCNT_inc_NN(*SP)
+                                              : SvREFCNT_inc_NN(value);
+
+        SP -= count;
+        PUTBACK;
+    }
+
+    FREETMPS;
+    LEAVE;
+
+    return handle;
+}
+
+/*
+=for apidoc multicore_offload
+
+Hand a blocking/CPU-bound C section to a worker thread while the interpreter
+stays on its thread.  C<work(work_arg)> is pure C and must not touch the
+interpreter; when it finishes, C<done(done_arg)> runs holding the interpreter and
+returns the result marshalled into an SV.
+
+The return value is a B<handle> object supplied by the registered backend.  The
+offload may still be in flight when this returns, and the caller takes the result
+out of the handle - with C<await> from a stackless caller, or C<get>, which
+blocks, from a stackful one.  Handing back one shape whichever backend is
+installed is what lets an XS module offer an asynchronous entry point without
+knowing which one the application chose; F<perlmulticore.h> gives the methods the
+handle implements, and the rule for how long C<work_arg> must stay valid.  A C
+consumer that only wants the value can use the C<multicore_offload_sync> wrapper
+there, which is the whole of what an offload used to be.
+
+This is the dual of the C<perlinterp_release>/C<perlinterp_acquire> bracket - it
+never migrates the interpreter, so it works where the bracket cannot: the bracket
+hands the interpreter to another OS thread and so needs a perl that is not
+I<using> ithreads, which on Windows is what the C<fork> emulation is built on.
+With no offload backend installed it runs C<work> then C<done> inline and hands
+back an already-resolved C<PerlMulticore::Handle> (blocking, but correct).
+B<Experimental.>
+
+=cut
+*/
+
+SV *
+Perl_multicore_offload(pTHX_ perl_multicore_work_t work, void *work_arg,
+                             perl_multicore_done_t done, void *done_arg)
+{
+    PERL_ARGS_ASSERT_MULTICORE_OFFLOAD;
+
+    if (PL_multicore_offload)
+        return PL_multicore_offload(work, work_arg, done, done_arg);
+
+    /* no backend: run inline (blocking) and marshal the result here.  The
+     * contexts are still supplied, so a module never has to special-case the
+     * backendless path: no cancellation is possible here, hence a NULL flag. */
+    {
+        perl_multicore_work_ctx work_ctx;
+        perl_multicore_done_ctx done_ctx;
+
+        work_ctx.size   = sizeof(perl_multicore_work_ctx);
+        work_ctx.cancel = NULL;
+
+        work(work_arg, &work_ctx);
+
+        done_ctx.size      = sizeof(perl_multicore_done_ctx);
+        done_ctx.cancelled = 0;
+        done_ctx.dropped   = 0;
+
+        return Perl_multicore_offload_ready(aTHX_ done(aTHX_ done_arg, &done_ctx));
+    }
+}
+
+/*
+=for apidoc multicore_offload_sync
+
+The synchronous form of C<multicore_offload> (see L<perlapi>): offload, wait for
+the handle,
+and return the value C<done> produced - which is the whole of what an offload was
+before it returned a handle.  This is what a module whose entry point must keep
+returning a value, or that offers no asynchronous entry point at all, wants: the
+call blocks (transparently, under a green-thread backend, which runs its other
+threads meanwhile), so the caller may keep its job on its own frame.
+
+Hands over a reference, as C<done> does.  A croak from C<done>, or an exception
+aimed at the calling green thread while it waits, is raised from here - after the
+work has stopped, never while the worker is still writing into the caller's frame.
+
+With no backend installed there is nothing to wait for and no handle worth
+building, so C<work> and C<done> run right here.  B<Experimental.>
+
+=cut
+*/
+
+SV *
+Perl_multicore_offload_sync(pTHX_ perl_multicore_work_t work, void *work_arg,
+                                  perl_multicore_done_t done, void *done_arg)
+{
+    SV *value;
+    dSP;
+
+    PERL_ARGS_ASSERT_MULTICORE_OFFLOAD_SYNC;
+
+    if (!PL_multicore_offload) {
+        perl_multicore_work_ctx work_ctx;
+        perl_multicore_done_ctx done_ctx;
+
+        work_ctx.size   = sizeof(perl_multicore_work_ctx);
+        work_ctx.cancel = NULL;
+
+        work(work_arg, &work_ctx);
+
+        done_ctx.size      = sizeof(perl_multicore_done_ctx);
+        done_ctx.cancelled = 0;
+        done_ctx.dropped   = 0;
+
+        return done(aTHX_ done_arg, &done_ctx);
+    }
+
+    ENTER;
+    SAVETMPS;
+
+    {
+        SV *handle = PL_multicore_offload(work, work_arg, done, done_arg);
+        SSize_t count;
+
+        /* The scope owns the handle from here on, so it is released however this
+         * leaves - including when `get` raises what `done` croaked with, and when
+         * the green thread waiting in it is cancelled outright, which is how the
+         * backend learns the job was dropped. */
+        SAVEFREESV(handle);
+
+        PUSHMARK(SP);
+        XPUSHs(handle);
+        PUTBACK;
+
+        count = call_method("get", G_SCALAR);
+
+        SPAGAIN;
+        value = count >= 1 ? SvREFCNT_inc_NN(*SP) : &PL_sv_undef;
+        SP -= count;
+        PUTBACK;
+    }
+
+    FREETMPS;
+    LEAVE;
+
+    return value;
+}
+
+/*
+=for apidoc multicore_register_offload
+
+Install (or, with C<NULL>, remove) the offload backend that L</C<multicore_offload>>
+dispatches to.  A backend that owns a worker-thread pool - such as one that also
+registers the release/acquire bracket - can provide both.  B<Experimental.>
+
+=cut
+*/
+
+void
+Perl_multicore_register_offload(pTHX_ perl_multicore_offload_t offload)
+{
+    PERL_UNUSED_CONTEXT;
+    PL_multicore_offload = offload;
+}
+
 void
 Perl_cx_dump(pTHX_ PERL_CONTEXT *cx)
 {
