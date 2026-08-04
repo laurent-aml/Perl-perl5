@@ -3914,6 +3914,28 @@ Perl_multiconcat_stringify(pTHX_ const OP *o)
 #define PERL_ARGS_ASSERT_MULTICONCAT_STRINGIFY  \
         Perl_assert_aTHX; assert(o)
 
+PERL_CALLCONV void
+Perl_multicore_acquire(void);
+#define PERL_ARGS_ASSERT_MULTICORE_ACQUIRE
+
+PERL_CALLCONV bool
+Perl_multicore_active(pTHX)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_MULTICORE_ACTIVE       \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_multicore_register(pTHX_ perl_multicore_hook_t release, perl_multicore_hook_t acquire)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_MULTICORE_REGISTER     \
+        Perl_assert_aTHX
+
+PERL_CALLCONV void
+Perl_multicore_release(pTHX)
+        Perl_attribute_nonnull_aTHX;
+#define PERL_ARGS_ASSERT_MULTICORE_RELEASE      \
+        Perl_assert_aTHX
+
 PERL_CALLCONV SV *
 Perl_multideref_stringify(pTHX_ const OP *o, CV *cv)
         Perl_attribute_nonnull_aTHX

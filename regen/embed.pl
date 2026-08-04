@@ -2185,6 +2185,8 @@ my @unresolved_visibility_overrides = qw(
     PBITVAL
     PBYTE
     PerlEnv_putenv
+    perlinterp_acquire
+    perlinterp_release
     PIPE_OPEN_MODE
     PIPESOCK_MODE
     PL_DBsingle

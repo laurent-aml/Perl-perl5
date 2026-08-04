@@ -1013,6 +1013,7 @@ CORE_NOCFG_H	=		\
 		..\opcode.h	\
 		..\perl.h	\
 		..\perlapi.h	\
+		..\perlmulticore.h	\
 		..\perlsdio.h	\
 		..\perly.h	\
 		..\pp.h		\
