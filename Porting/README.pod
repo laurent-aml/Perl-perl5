@@ -190,6 +190,12 @@ This file is built by F<metaconfig>. This file contains a description of all
 the shell variables whose value is determined by the Configure script. 
 It later gets incorporated into the pod for F<Config.pm>.
 
+=head2 F<green_threads_and_execstate.md>
+
+A study of the concurrency models available to Perl - ithreads, process pools,
+and stackful and stackless green threads - and the case it makes for the
+execstate, parkapi and multicore APIs documented alongside it.
+
 =head2 F<harness-timer-report.pl>
 
 For analyzing the output of "env HARNESS_TIMER=1 make test", to find
