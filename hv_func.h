@@ -14,6 +14,7 @@
         || defined(PERL_HASH_FUNC_SIPHASH) \
         || defined(PERL_HASH_FUNC_SIPHASH13) \
         || defined(PERL_HASH_FUNC_ZAPHOD32) \
+        || defined(PERL_HASH_FUNC_RAPIDHASH) \
     )
 #   ifdef CAN64BITHASH
 #       define PERL_HASH_FUNC_SIPHASH13
@@ -73,6 +74,16 @@
 # define PVT__PERL_HASH_SEED_STATE(seed,state) zaphod32_seed_state(seed,state)
 # define PVT__PERL_HASH_WITH_STATE(state,str,len) (U32)zaphod32_hash_with_state((state),(U8*)(str),(len))
 # include "zaphod32_hash.h"
+#elif defined(PERL_HASH_FUNC_RAPIDHASH)
+# define PERL_HASH_FUNC_DEFINE "PERL_HASH_FUNC_RAPIDHASH"
+# define PVT__PERL_HASH_FUNC "RAPIDHASH"
+# define PVT__PERL_HASH_WORD_TYPE U64
+# define PVT__PERL_HASH_WORD_SIZE sizeof(PVT__PERL_HASH_WORD_TYPE)
+# define PVT__PERL_HASH_SEED_BYTES PVT__PERL_HASH_WORD_SIZE
+# define PVT__PERL_HASH_STATE_BYTES PVT__PERL_HASH_WORD_SIZE
+# define PVT__PERL_HASH_SEED_STATE(seed,state) rapidhash_seed_state(seed,state)
+# define PVT__PERL_HASH_WITH_STATE(state,str,len) rapidhash_hash_with_state((state),(U8*)(str),(len))
+# include "rapidhash_hash.h"
 #endif
 
 #ifndef PVT__PERL_HASH_WITH_STATE

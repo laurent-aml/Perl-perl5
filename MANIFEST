@@ -131,6 +131,7 @@ pp_proto.h				C++ definitions for Push/Pop code
 pp_sort.c				Push/Pop code for sort
 pp_sys.c				Push/Pop code for system interaction
 proto.h					Prototypes
+rapidhash_hash.h			Rapid hash algorithm
 README					The Instructions
 README.aix				Perl notes for AIX
 README.amiga				Perl notes for AmigaOS
