@@ -830,11 +830,13 @@ SKIP: {
 	    if $ENV{PERL_VALGRIND} || $Is_VMS;
 
 	    $PATH = $ENV{PATH};
+	    $LDLP = $ENV{LD_LIBRARY_PATH} if exists $ENV{LD_LIBRARY_PATH};
 	    $SYSTEMROOT = $ENV{SYSTEMROOT} if exists $ENV{SYSTEMROOT}; # win32
 	    $PDL = $ENV{PERL_DESTRUCT_LEVEL} || 0;
 	    $ENV{foo} = "bar";
 	    %ENV = ();
 	    $ENV{PATH} = $PATH;
+	    $ENV{LD_LIBRARY_PATH} = $LDLP if defined $LDLP;
 	    $ENV{SYSTEMROOT} = $SYSTEMROOT if defined $SYSTEMROOT;
 	    $ENV{PERL_DESTRUCT_LEVEL} = $PDL || 0;
 	    if ($Is_MSWin32) {
