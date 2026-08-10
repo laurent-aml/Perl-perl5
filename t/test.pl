@@ -186,6 +186,19 @@ sub find_git_or_skip {
         }
     }
 
+    # If the source tree itself carries no git metadata - an unpacked release
+    # tarball, a `git archive` export, or any non-git build tree - these
+    # history-based tests cannot run.  Skip here, up front, rather than let a
+    # stray $GIT_DIR in the environment lure the checks below into running git
+    # against an unrelated repository.  A `.git` *file* (a worktree/submodule
+    # gitlink) or a symlinked MANIFEST (a symlink build tree, handled below)
+    # still counts as a git checkout, so both are allowed through.
+    unless (-e '.git' or -l 'MANIFEST') {
+        $reason = 'no .git in the source tree';
+        skip_all($reason) if $_[0] && $_[0] eq 'all';
+        return skip($reason, @_);
+    }
+
     if (-d '.git') {
 	$source_dir = '.';
     } elsif (-l 'MANIFEST' && -l 'AUTHORS') {
