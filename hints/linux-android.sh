@@ -5,6 +5,14 @@ case "$userelocatableinc" in
 '') userelocatableinc='define' ;;
 esac
 
+uname_minus_m="`$run uname -m 2>/dev/null`"
+sysarchlib=lib
+case "$uname_minus_m" in
+aarch64)
+   androidarchlib=lib64
+   ;;
+esac
+
 # The Android linker has some unusual behavior: No matter what
 # path is passed in to dlopen(), it'll only use the path's
 # basename when trying to find a cached library.
@@ -310,7 +318,7 @@ esac
 
 ;;
 *)
-ldflags="$ldflags -L/system/lib"
+ldflags="$ldflags -L/system/${androidarchlib}"
 ;;
 esac
 
@@ -327,7 +335,7 @@ esac
 $cat <<'EOO' >> $pwd/config.arch
 
 osname='android'
-eval "libpth='$libpth /system/lib /vendor/lib'"
+eval "libpth='$libpth /system/${androidarchlib} /vendor/${androidarchlib}'"
 
 if $test "X$procselfexe" = X; then
     case "$d_procselfexe" in
