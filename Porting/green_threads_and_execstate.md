@@ -417,6 +417,115 @@ the cores. The Perl analogue is: keep one interpreter, let green threads schedul
 the Perl side, and let blocking or CPU-bound XS run on OS threads. Threading *the
 XS part* — not the Perl part — is what most people are really after.
 
+### PDL: the pattern already shipped — and where it stops
+
+PDL is the closest thing Perl has to NumPy, and it is worth looking at because it
+demonstrates both halves of this split *and* the seam between them.
+
+It demonstrates the orchestration half so thoroughly that it is packaged that way:
+alongside its plain 32- and 64-bit editions, Strawberry Perl publishes a dedicated
+**PDL edition** — an entire Perl distribution assembled around "Perl orchestrates,
+XS executes", with the numeric stack and its supporting libraries prebuilt. That
+is about as direct an endorsement of the model as an ecosystem can give.
+
+It also already does the *parallel* half, without any help from perl. Built with
+POSIX threads, `set_autopthread_targ` / `set_autopthread_size` split an
+operation's implicit-loop dimensions across a pool of pthreads that execute only
+generated C and never touch the interpreter. (Confusingly, PDL historically called
+that implicit looping "threading"; it is now called *broadcasting*, precisely
+because it is a loop-shape feature and not a CPU-count one. The pthread support is
+the separate, genuinely parallel thing.)
+
+What PDL does **not** do is release the interpreter. During a pthreaded operation
+the calling perl thread sits inside the XS call holding the interpreter, so
+nothing else in the program advances: a program that is otherwise happily running
+thousands of green threads stops dead for the duration of a large PDL op. That is
+exactly the gap the release/acquire bracket fills, and PDL is close to the ideal
+candidate for it — the parallel loop has *already* been shown not to touch perl
+data, which is the hard precondition the bracket needs, so bracketing it would be
+close to safe by construction.
+
+The two mechanisms are orthogonal and compose: PDL's pthreads parallelise *within*
+one operation, while multicore overlaps that operation with everything else the
+interpreter has to do. Together they are the whole model.
+
+Which of the two multicore modes to use is decided by the platform, and for PDL
+the answer on Windows is the interesting one. The release/acquire bracket there
+needs the non-ithreads build (see *Windows: the ithreads build is the obstacle*),
+which the PDL edition — a Strawberry build — is not. **Offload does not**: it
+never migrates the interpreter, so none of that applies. It is therefore the route
+that leaves the shipped Windows distribution, and its whole prebuilt module set,
+exactly as it is.
+
+The distinction worth being precise about is between ithreads being *built* and
+being *used*, and it is worth being careful about which sense of "thread" is
+meant. Offload is indifferent to the build flags — an ithreads-enabled perl is
+fine — and it is equally indifferent to *OS* threads, because the interpreter
+stays on its own thread by construction; that is the whole point of the primitive.
+Nothing here asks the program to stay on a particular thread.
+
+What the existing backend cannot serve is a second **live interpreter** — a
+limitation of that implementation rather than of the hook, as *Not inherently
+single-interpreter* below sets out. Coro imposes the same restriction
+independently of multicore, for its own reasons: use it from the first interpreter
+only.
+
+So the run-time constraint is not "recompile perl without ithreads", and not "keep
+off other OS threads" — it is "do not start a second interpreter", i.e. leave
+`threads->create` alone. That costs a PDL workload nothing, since its parallelism
+comes from pthreads inside the C loop rather than from perl-level threads.
+
+Offload also decouples PDL from Coro specifically. The release/acquire bracket
+needs a suspended C frame to return into, so it serves the stackful model only;
+offload serves the stackless one as well, and PDL is close to the best case for it
+— for exactly the reason that made `done()` cheap above. Where a marshalling
+module has to rebuild its result from the caller's argument stack (see the
+FFI::Platypus appendix, where that is fatal under Future::AsyncAwait), a PDL
+operation writes into an output ndarray that already exists as an SV before the
+computation starts. Nothing has to be *produced* at resolution time, so nothing is
+lost when the caller's frame is gone: `done()` needs only the transformation and
+the output ndarray, both captured in the job at call time.
+
+Getting there is real work, and of a different shape from the Coro case:
+
+- **Retained lifetimes.** A suspended coro holds its ndarrays alive on its own
+  stack; an awaiting FAA caller does not. The job has to retain every
+  participating ndarray and release them in `done()`.
+- **PDL is eager, so this is surgery, not a bracket.** `pdl_make_trans_mutual`
+  runs the transformation inline unless dataflow is enabled. An async entry point
+  needs a third path — set the transformation up, do *not* run it, return the
+  deferred, run on a worker, resolve — and that path must compose with the existing
+  dataflow branch, which is already a second deferral mechanism on the same object.
+- **A mutation window the stackful path does not have.** While the worker reads the
+  input buffers, a suspended coro cannot touch them; an FAA caller has not stopped
+  and can modify its own inputs, in the same flow of control. That is a data race
+  Coro structurally cannot produce, and it wants a mechanism rather than a
+  documentation note — an in-flight flag on participating ndarrays that makes
+  mutation fail loudly, in the spirit of the existing untouchable-data and
+  transient-busy flags.
+
+None of that is exotic: refcount discipline, one restructured decision, one new
+guard. The point is that the *hard* part — delivering a result without the
+caller's stack — is already how PDL works, so a well-implemented offload gets
+both concurrency models rather than only Coro.
+
+None of this waits on core. Offload could reach PDL exactly the way the
+release/acquire bracket already reaches CPAN today — a vendored header and a
+rendezvous in `PL_modglobal` — and because the header runs `work` then `done`
+inline when no backend is installed, a PDL so patched behaves identically for
+everyone who has no backend loaded. What a PDL edition actually needs is a backend
+and the patch; the core hook is the same neutrality argument made for the bracket,
+not a precondition.
+
+Which does place a caveat on the prototype described below: it puts the offload
+hook in core proper, so *as prototyped* it does need a patched perl. Note which
+fallback that gives and which it does not. A missing *backend* is handled for you —
+the call runs inline, blocking but correct — but a missing *hook* is not: on an
+unpatched perl the declarations are simply absent, so a consumer has to guard its
+offload path at compile time, much as Coro::Multicore already guards its own. That
+is an implementation choice about where the rendezvous lives, not a limit on what
+is reachable from CPAN.
+
 ### Coro::Multicore
 
 `Coro::Multicore` implements exactly this. It couples Coro's cooperative
@@ -722,6 +831,23 @@ method — the price of colouring. So the bracket is the near-transparent upgrad
 for existing synchronous Unix+Coro modules, and offload is the portable,
 model-agnostic path for code written — or rewritten — for it.
 
+**Not inherently single-interpreter.** Nothing in the offload design ties it to one
+interpreter. The worker never touches perl, so it has no interpreter to be wrong
+about, and the registration side is already per-interpreter by construction: the
+hook struct lives in `PL_modglobal`, which ithreads clones along with everything
+else. Several live interpreters could therefore each register a backend and drive
+their own pool, or agree to share one.
+
+The existing backend does not, however. Coro::Multicore holds its job pool,
+wake-up pipe, enable flags and cached `Coro::API` pointer in process-wide C
+statics, so a second live interpreter finds either no backend registered at all
+or — if the module is loaded there too — one pool and one pipe shared between two
+interpreters. For practical purposes this costs nothing: ithreads is discouraged
+for the reasons given earlier, and Coro independently requires the first
+interpreter, so this is a corner nobody should be trying to occupy. It is worth
+recording only because the limitation belongs to the *backend* rather than to the
+hook — which would matter if core ever shipped a default backend of its own.
+
 The whole core surface is a short header, two interpreter-global hooks, and a
 handful of tiny functions — the hard machinery (the worker-thread pool, the
 migration of the running thread) stays entirely in the backend.
@@ -765,24 +891,108 @@ on Coro, and let perl own the contract.
 **Portability: on Windows, offload — not the bracket.** The transparent
 release/acquire bracket works by *migrating the interpreter across OS threads* —
 the blocking call stays put while a worker thread picks up the interpreter and
-resumes other coros. On Unix that is fine; on Windows it is not realistically
-fixable. Two things stand in the way: Windows emulates `fork` by cloning an
-interpreter onto another thread in the *same* address space, which by itself
-collides with a multicore worker pool; and, more fundamentally, Windows ties a
-running call's execution state to the OS thread it started on, so a coroutine
-cannot safely resume on a different thread than it suspended on. Marc Lehmann's
-"win32 perls are beyond fixing" applies squarely here: transparent
-Coro::Multicore does not run on Windows and realistically cannot.
+resumes other coros. On Unix that is fine. On Windows what stands in the way is
+the *standard build* rather than the platform: the obstacles are properties of the
+ithreads-enabled perl that everyone ships there, and a non-ithreads build removes
+the documented ones — see *Windows: the ithreads build is the obstacle* below,
+which also sets out what remains unproven once they are gone.
 
-The **offload** primitive is the way out, for exactly the reason given where it
-is introduced above: the interpreter never migrates, so none of these Windows
-constraints touch it, and the deeper XS restructuring it asks for is the price
-paid once for code that then runs on every platform and under both models. One
-Windows-specific point to add: since `fork` under a live worker pool is hazardous
-anyway, such a build should make Perl's emulated `fork` fail fast while multicore
-is enabled rather than let it clone into the pool. This is why the core hook is
-deliberately two-pronged — the transparent bracket where the platform allows
-interpreter migration, offload where it does not.
+The **offload** primitive is the way out that needs none of that, for exactly the
+reason given where it is introduced above: the interpreter never migrates, so no
+Windows constraint touches it, and the deeper XS restructuring it asks for is the
+price paid once for code that then runs on every platform and under both models.
+One Windows-specific point to add: since `fork` under a live worker pool is
+hazardous anyway, such a build should make Perl's emulated `fork` fail fast while
+multicore is enabled rather than let it clone into the pool. This is why the core
+hook is deliberately two-pronged — the transparent bracket where the platform and
+build allow interpreter migration, offload where they do not.
+
+## Windows: the ithreads build is the obstacle
+
+It is tempting to read "Coro::Multicore does not work on Windows" as a statement
+about Windows. It is mostly a statement about the perl that Windows ships. Worth
+separating, because one of the two obstacles is removable and the other is not
+what it is usually taken to be.
+
+**What ithreads costs here.** Every mainstream Windows perl — Strawberry,
+ActivePerl — is built `useithreads=define usemultiplicity=define`, and that build
+also enables `PERL_IMPLICIT_SYS`, which routes even ISO-C calls such as `malloc`
+and `setjmp` through the `PerlHost` layer and so requires a `dTHX` to be in scope
+for them. That is the concrete referent of Marc Lehmann's "win32 perls are beyond
+fixing" comment at the top of `Multicore.xs`: not the operating system, but the
+implicit-sys indirection that the threaded build turns on. Separately, ithreads
+is *also* what supplies Windows' emulated `fork` — an interpreter cloned onto
+another thread of the same address space — which collides with a worker pool.
+Both are properties of the build.
+
+**The no-ithreads alternative.** `win32/GNUmakefile` exposes `USE_MULTI`,
+`USE_ITHREADS` and `USE_IMP_SYS` as three independent switches (each defaulting
+to `undef` when commented out, with `USE_MULTI` auto-enabled by either of the
+others). With all three off the picture inverts: `PERL_SET_CONTEXT` degenerates
+to assigning `PL_curinterp`, `dTHXa` expands to nothing, and the implicit-sys
+objection disappears entirely. The interpreter becomes one set of plain globals —
+the *simplest possible* substrate for handing it between OS threads, simpler than
+Unix-with-ithreads. The emulated `fork` disappears too, which removes the pool
+collision rather than merely mitigating it.
+
+The consequence is a packaging one, not a technical one. Dropping the flags
+changes `archname` — the `-multi-thread` suffix goes away — so such a perl cannot
+load XS modules compiled for the threaded one. That sounds like a wall only if one
+imagines each user rebuilding CPAN by hand. The natural answer is the one
+Strawberry already applies to every other archname-affecting flag: ship it as an
+**edition**. Strawberry's 32-bit, 64-bit, 64-bit-integer and long-double builds are
+already mutually binary-incompatible, each with its own prebuilt module set, and
+the PDL edition shows the project is willing to assemble a distribution around a
+particular use case. A non-ithreads edition is the same kind of variant, and the
+rebuild is done once by whoever assembles it rather than by anyone who installs
+it.
+
+That reframes the cost honestly. It is not "you lose the binary ecosystem"; it is
+"somebody has to build a second one, and users then pick the edition matching what
+they need" — a real but bounded, one-off distribution effort, of exactly the kind
+this ecosystem already absorbs routinely.
+
+**What still has to hold.** With the build objection gone, the remaining
+requirements are not about perl at all:
+
+- **The coroutine backend must survive thread migration.** The bracket parks a
+  worker thread's machine context in the released coro's saved-context slot and
+  resumes it later from whichever thread next runs the scheduler. libcoro's
+  `CORO_ASM` context is a bare stack pointer, so the slot can be reused that way,
+  and its Windows path maintains the TIB stack bounds (`StackBase`/`StackLimit`)
+  on every switch — on whichever thread performs the switch, which is exactly the
+  property needed. `CORO_FIBER` cannot: its transfer records the current fiber
+  only when the slot is empty, so a worker's identity is never stored, and a later
+  switch would target a fiber another thread is still executing, which Windows
+  forbids outright. Since Windows' *default* libcoro backend is not `CORO_ASM`,
+  this is a deliberate build choice rather than something obtained for free.
+- **Small portability gaps in the backend.** `Coro::Multicore` calls
+  `pthread_atfork` directly (meaningless on a fork-less perl, and absent from the
+  Windows pthread shims), and its `pthread_sigmask` calls compile to nothing on
+  Win32 — silently dropping the "worker threads never handle perl signals"
+  discipline the surrounding code relies on.
+- **Win64 exception handling is the real unknown.** A croak raised while a worker
+  runs perl on a coro stack has to unwind to that worker's own `JMPENV`, and on
+  Win64 `longjmp` participates in SEH-based unwinding. Unwinding to a `jmp_buf`
+  living on a different stack from the one executing is not something the ABI
+  contemplates. This is where trouble should be expected first, and it is
+  unexercised anywhere today.
+
+**Status, honestly.** Non-ithreads plus `CORO_ASM` is the only combination in
+which the transparent bracket is *structurally* possible on Windows; with
+`CORO_FIBER` it is ruled out rather than merely untested. "No structural blocker
+found" is a weaker claim than "works", and nobody has run it. Windows ARM64 does
+not reach the question yet: `win32/GNUmakefile` has no arm64 case, so ARM64 means
+MSVC, which has no GCC-style inline assembly, which forces the fiber backend. A
+Strawberry ARM64 edition — in progress at the time of writing — would change that,
+since it implies both a mingw-style arm64 toolchain and the makefile support to
+use it.
+
+So the recommendation stands, with a better reason than "Windows is hopeless":
+**offload for portability**, because it asks nothing of the build, nothing of the
+coroutine backend and nothing of the packaging; **non-ithreads plus `CORO_ASM`** if
+the transparent bracket on Windows is worth a second edition and the validation
+work, because it is the only road there.
 
 ## An honest assessment: the social obstacle
 
@@ -1082,9 +1292,11 @@ coro, runs `ffi_call` on a worker, resumes the coro to marshal the result inline
 value directly. `$sub->(...)` stays an ordinary synchronous call while other
 coros keep running.
 
-Crucially, offload does this **where release/acquire cannot: Windows.** The
-release/acquire bracket works by *migrating the interpreter* between OS threads,
-which Coro's Windows backend does not support; offload keeps the interpreter
+Crucially, offload does this **where the bracket does not reach: Windows as
+shipped.** The release/acquire bracket works by *migrating the interpreter* between
+OS threads, which Coro's default Windows backend cannot do and which the standard
+ithreads build obstructs besides (see *Windows: the ithreads build is the
+obstacle*); offload needs none of that and keeps the interpreter
 pinned and moves only the C work, so a multicore FFI call runs off the
 interpreter thread on Windows too. For FFI, that portability — not the FAA story
 — is the concrete win of the offload hook.
@@ -1100,3 +1312,13 @@ FFI::Platypus is the archetype. The offload primitive therefore delivers "FAA
 multi-core without Coro" for the well-behaved case and for purpose-written async
 XS, but not universally: stack-bound result delivery, layered on top of function
 colouring, is the boundary.
+
+There is a second qualifying shape, and for numeric work it matters more than the
+first: modules that deliver their result **in place**, into a buffer that already
+exists before the computation starts. Then there is nothing to produce at
+resolution time at all, and independence from the caller's stack comes by
+construction rather than by careful factoring. PDL is the archetype — see *PDL:
+the pattern already shipped — and where it stops* — which is why the
+Future::AsyncAwait story there is considerably better than this appendix's own
+subject would suggest. The boundary is stack-bound *delivery*, not offload, and
+not FAA.
