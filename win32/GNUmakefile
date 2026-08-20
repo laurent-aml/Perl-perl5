@@ -96,14 +96,14 @@ USE_MULTI	:= define
 # This should be enabled to get the fork() emulation.  This needs (and
 # will auto-enable) USE_MULTI above.
 #
-USE_ITHREADS	:= define
+USE_ITHREADS	:= undef
 
 #
 # uncomment to enable the implicit "host" layer for all system calls
 # made by perl.  This is also needed to get fork().  This needs (and
 # will auto-enable) USE_MULTI above.
 #
-USE_IMP_SYS	:= define
+USE_IMP_SYS	:= undef
 
 #
 # Comment out next assign to disable perl's I/O subsystem and use compiler's
@@ -169,7 +169,7 @@ DEFAULT_INC_EXCLUDES_DOT := define
 # Visual C++ 2022 (aka Visual C++ 14.3) (full version or Community Edition)
 #CCTYPE		:= MSVC143
 # MinGW or mingw-w64 with gcc-3.4.5 or later
-#CCTYPE		:= GCC
+CCTYPE		:= GCC
 
 #
 # If you are using Intel C++ Compiler uncomment this

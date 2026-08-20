@@ -5257,7 +5257,7 @@
  *	This symbol, if defined, indicates to the C program that it should
  *	include <pthread.h>.
  */
-/*#define   I_PTHREAD	/ **/
+#define I_PTHREAD	/**/
 
 /* USE_ITHREADS:
  *	This symbol, if defined, indicates that Perl should be built to
