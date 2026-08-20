@@ -277,6 +277,12 @@ insert that content into the file.
 
 Generates info for F<perlhist> from this perl tree.
 
+=head2 F<perlmulticore_xs_example.md>
+
+The same XSUB in three forms - unported, bracketed with release/acquire, and
+restructured for offload - as a worked example of porting an XS module to the
+multicore hook.
+
 =head2 F<pod_lib.pl>
 
 When C<require>d into other programs in the Perl 5 core
