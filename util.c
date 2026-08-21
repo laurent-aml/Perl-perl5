@@ -6709,10 +6709,15 @@ Perl_dump_c_backtrace(pTHX_ PerlIO* fp, int depth, int skip)
 
 #endif /* #ifdef USE_C_BACKTRACE */
 
-#if defined(USE_ITHREADS) && defined(I_PTHREAD)
+#if defined(PERL_TSA_ACTIVE) && defined(PERL_MUTEX_IS_PTHREAD)
 
-/* pthread_mutex_t and perl_mutex are typedef equivalent
- * so casting the pointers is fine. */
+/* Here - and only here - perl_mutex is a pthread_mutex_t (see the thread
+ * implementation selector in perl.h), so casting the pointers is fine.  Testing
+ * I_PTHREAD alone was not enough: a platform can have <pthread.h> and still take
+ * its mutexes from elsewhere, which is exactly the case on mingw, where WIN32
+ * wins the selector and perl_mutex comes from win32thread.h.  These wrappers are
+ * only ever called from thread.h under PERL_TSA_ACTIVE, so that is the other half
+ * of the condition. */
 
 int perl_tsa_mutex_lock(perl_mutex* mutex)
 {

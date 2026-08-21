@@ -3716,6 +3716,11 @@ typedef condition_t	perl_cond;
 typedef void *		perl_key;
 #  elif defined(I_PTHREAD) /* Posix threads */
 #    include <pthread.h>
+/* This is the one arm in which perl_mutex really is a pthread_mutex_t, which is
+ * what lets util.c's perl_tsa_mutex_* wrappers cast between the two.  The arms
+ * above take their mutexes from elsewhere - notably WIN32, which is matched first
+ * and so wins even where I_PTHREAD is also defined, as it is on mingw. */
+#    define PERL_MUTEX_IS_PTHREAD 1
 typedef pthread_t	perl_os_thread;
 typedef pthread_mutex_t PERL_TSA_CAPABILITY("mutex") perl_mutex;
 typedef pthread_cond_t	perl_cond;
@@ -3732,7 +3737,7 @@ typedef struct {
 
 #endif /* USE_ITHREADS */
 
-#ifdef PERL_TSA_ACTIVE
+#if defined(PERL_TSA_ACTIVE) && defined(PERL_MUTEX_IS_PTHREAD)
 /* Since most pthread mutex interfaces have not been annotated, we
  * need to have these wrappers. The NO_TSA annotation is quite ugly
  * but it cannot be avoided in plain C, unlike in C++, where one could
