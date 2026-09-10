@@ -211,6 +211,13 @@ ccflags (ccflags.U):
 	This variable contains any additional C compiler flags desired by
 	the user.  It is up to the Makefile to use this.
 
+ccflags_pthread (pthreadflags.U):
+	This variable holds the compiler flags needed to compile code that
+	uses POSIX threads on this platform, or is empty when none are needed.
+	It is determined regardless of usethreads, because an extension may use
+	threads in a perl that does not, and such a perl has linked nothing for
+	it.  See also ldflags_pthread.
+
 ccflags_uselargefiles (uselfs.U):
 	This variable contains the compiler flags needed by large file builds
 	and added to ccflags by hints files.
@@ -4180,6 +4187,12 @@ lddlflags (dlsrc.U):
 ldflags (ccflags.U):
 	This variable contains any additional C loader flags desired by
 	the user.  It is up to the Makefile to use this.
+
+ldflags_pthread (pthreadflags.U):
+	This variable holds what has to be added to the link line to use POSIX
+	threads on this platform - a library such as -lpthread or -lpthreads, a
+	driver flag such as -pthread, or nothing where they are part of libc.
+	See also ccflags_pthread.
 
 ldflags_uselargefiles (uselfs.U):
 	This variable contains the loader flags needed by large file builds
