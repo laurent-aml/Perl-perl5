@@ -10718,7 +10718,25 @@ eval $inhdr
 : what does this platform need in order to compile and link pthread code?
 : this is asked regardless of usethreads, because an extension may use pthreads
 : in a perl that does not - the perl binary has then linked nothing for it.
-case "$i_pthread" in
+:
+: a hint file, or the command line, may set ccflags_pthread and ldflags_pthread
+: instead, and is then believed rather than second-guessed: it can know things a
+: link test cannot see.  Setting either to 'none' asserts that this platform
+: needs nothing, which a bare empty value cannot say, that being also what an
+: unset variable looks like here.
+pthreadflags_given=''
+case "$ccflags_pthread$ldflags_pthread" in
+'')	;;
+*)	pthreadflags_given="$define" ;;
+esac
+case "$ccflags_pthread" in
+none)	ccflags_pthread='' ;;
+esac
+case "$ldflags_pthread" in
+none)	ldflags_pthread='' ;;
+esac
+
+case "$i_pthread$pthreadflags_given" in
 $define)
 	echo " "
 	echo "Checking what your compiler needs to use POSIX threads..." >&4
@@ -10764,8 +10782,22 @@ EOCP
 	$rm_try
 	;;
 *)
-	ccflags_pthread=''
-	ldflags_pthread=''
+	case "$i_pthread" in
+	$define)
+		: given by a hint or on the command line - reported, not re-derived
+		case "$ccflags_pthread$ldflags_pthread" in
+		'')	echo "Your compiler doesn't need any special flags to use POSIX threads, so your hints say" >&4 ;;
+		*)	case "$ccflags_pthread" in
+			"$ldflags_pthread") echo "Your compiler needs $ldflags_pthread to use POSIX threads, so your hints say" >&4 ;;
+			*) echo "Your compiler needs${ccflags_pthread:+ $ccflags_pthread to compile and}${ldflags_pthread:+ $ldflags_pthread to link} to use POSIX threads, so your hints say" >&4 ;;
+			esac ;;
+		esac
+		;;
+	*)
+		ccflags_pthread=''
+		ldflags_pthread=''
+		;;
+	esac
 	;;
 esac
 

@@ -216,7 +216,9 @@ ccflags_pthread (pthreadflags.U):
 	uses POSIX threads on this platform, or is empty when none are needed.
 	It is determined regardless of usethreads, because an extension may use
 	threads in a perl that does not, and such a perl has linked nothing for
-	it.  See also ldflags_pthread.
+	it.  Configure probes for it, unless a hint file or the command line has
+	set it, in which case that value is used as it stands; set it to 'none'
+	to assert that this platform needs nothing.  See also ldflags_pthread.
 
 ccflags_uselargefiles (uselfs.U):
 	This variable contains the compiler flags needed by large file builds
@@ -4192,7 +4194,7 @@ ldflags_pthread (pthreadflags.U):
 	This variable holds what has to be added to the link line to use POSIX
 	threads on this platform - a library such as -lpthread or -lpthreads, a
 	driver flag such as -pthread, or nothing where they are part of libc.
-	See also ccflags_pthread.
+	Probed or hinted in the same way as ccflags_pthread, which see.
 
 ldflags_uselargefiles (uselfs.U):
 	This variable contains the loader flags needed by large file builds
