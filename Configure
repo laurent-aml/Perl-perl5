@@ -1364,6 +1364,8 @@ dtrace=''
 usedtrace=''
 usefaststdio=''
 usekernprocpathname=''
+ccflags_pthread=''
+ldflags_pthread=''
 ccflags_uselargefiles=''
 ldflags_uselargefiles=''
 libswanted_uselargefiles=''
@@ -1506,6 +1508,8 @@ useopcode=true
 : set uselanginfo=false in your hint file to disable the I18N::Langinfo extension.
 uselanginfo=true
 archname64=''
+ccflags_pthread=''
+ldflags_pthread=''
 ccflags_uselargefiles=''
 ldflags_uselargefiles=''
 libswanted_uselargefiles=''
@@ -10710,6 +10714,60 @@ eval $inlibc
 : see if POSIX threads are available
 set pthread.h i_pthread
 eval $inhdr
+
+: what does this platform need in order to compile and link pthread code?
+: this is asked regardless of usethreads, because an extension may use pthreads
+: in a perl that does not - the perl binary has then linked nothing for it.
+case "$i_pthread" in
+$define)
+	echo " "
+	echo "Checking what your compiler needs to use POSIX threads..." >&4
+	$cat >try.c <<'EOCP'
+#include <pthread.h>
+static void *thr(void *p) { (void)p; return 0; }
+int main(void) {
+	pthread_t t;
+	if (pthread_create(&t, 0, thr, 0)) return 1;
+	return pthread_join(t, 0) != 0;
+}
+EOCP
+	xxx_pthread=''
+	: the empty candidate first, so a platform with pthreads in libc asks for
+	: nothing; -pthread before -lpthread, as it is the spelling that also sets
+	: whatever the compiler side needs, and gcc turns it into -lpthread anyway
+	: deliberately not $compile, which appends $libs - on Linux libswanted
+	: carries pthread whatever usethreads says, so the empty candidate would
+	: always appear to work and this would measure nothing.  An extension is
+	: linked without $libs, so the probe has to be too.
+	for xxx in '' '-pthread' '-lpthread' '-lpthreads' '-lthread' '-lc_r'; do
+		if $cc -o try $optimize $ccflags $ldflags $xxx try.c >/dev/null 2>&1; then
+			xxx_pthread=define
+			case "$xxx" in
+			'')	;;
+			-l*)	ldflags_pthread="$xxx" ;;
+			*)	ccflags_pthread="$xxx"
+				ldflags_pthread="$xxx" ;;
+			esac
+			break
+		fi
+	done
+	case "$xxx_pthread" in
+	'')	echo "Hmm.  I cannot get POSIX threads to compile and link here." >&4 ;;
+	*)	case "$ccflags_pthread$ldflags_pthread" in
+		'')	echo "Your compiler doesn't need any special flags to use POSIX threads" >&4 ;;
+		*)	case "$ccflags_pthread" in
+			"$ldflags_pthread") echo "Your compiler needs $ldflags_pthread to use POSIX threads" >&4 ;;
+			*) echo "Your compiler needs${ccflags_pthread:+ $ccflags_pthread to compile and}${ldflags_pthread:+ $ldflags_pthread to link} to use POSIX threads" >&4 ;;
+			esac ;;
+		esac ;;
+	esac
+	$rm_try
+	;;
+*)
+	ccflags_pthread=''
+	ldflags_pthread=''
+	;;
+esac
 
 : define a function to check prototypes
 $cat > protochk <<EOSH
@@ -24916,6 +24974,7 @@ cc='$cc'
 cccdlflags='$cccdlflags'
 ccdlflags='$ccdlflags'
 ccflags='$ccflags'
+ccflags_pthread='$ccflags_pthread'
 ccflags_uselargefiles='$ccflags_uselargefiles'
 ccname='$ccname'
 ccsymbols='$ccsymbols'
@@ -25750,6 +25809,7 @@ ld='$ld'
 ld_can_script='$ld_can_script'
 lddlflags='$lddlflags'
 ldflags='$ldflags'
+ldflags_pthread='$ldflags_pthread'
 ldflags_uselargefiles='$ldflags_uselargefiles'
 ldlibpthname='$ldlibpthname'
 less='$less'

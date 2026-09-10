@@ -5,6 +5,24 @@ use Config;
 
 my $dtrace_o = $Config{dtraceobject} ? ' dtrace$(OBJ_EXT)' : '';
 
+# Extra compiler flags, gathered here so that there is a single CCFLAGS key
+# below - a duplicate would silently discard whichever came first.
+my @ccflags;
+push @ccflags, '-Wno-deprecated-declarations'
+    if $Config{gccversion} && $Config{d_attribute_deprecated};
+
+# APItest.xs calls pthread_create/pthread_join for the multicore offload test
+# backend (guarded by I_PTHREAD).  An extension cannot assume the perl binary
+# linked a thread library: one built without threads has not, and before glibc
+# 2.34 those symbols live in libpthread rather than libc, so the .so then fails
+# to load with "undefined symbol: pthread_join".
+#
+# Use what Configure probed rather than a spelling guessed here: it is -pthread
+# on gcc and the BSDs, -lpthread or -lpthreads elsewhere, and nothing at all
+# where pthreads are part of libc.  Both variables are empty on a perl whose
+# Configure predates the probe, which then behaves as it did before.
+push @ccflags, $Config{ccflags_pthread} if $Config{ccflags_pthread};
+
 WriteMakefile(
     'NAME'		=> 'XS::APItest',
     'VERSION_FROM'	=> 'APItest.pm', # finds $VERSION
@@ -14,8 +32,10 @@ WriteMakefile(
     'C'                 => ['exception.c', 'core.c', 'notcore.c'],
     'OBJECT'            => '$(BASEEXT)$(OBJ_EXT) XSUB-undef-XS_VERSION$(OBJ_EXT) XSUB-redefined-macros$(OBJ_EXT) $(O_FILES)'. $dtrace_o,
     realclean => {FILES	=> 'const-c.inc const-xs.inc'},
-    ($Config{gccversion} && $Config{d_attribute_deprecated} ?
-      (CCFLAGS => $Config{ccflags} . ' -Wno-deprecated-declarations') : ()),
+    (@ccflags ? (CCFLAGS => join ' ', $Config{ccflags}, @ccflags) : ()),
+    ($Config{ldflags_pthread}
+       ? (dynamic_lib => { OTHERLDFLAGS => $Config{ldflags_pthread} })
+       : ()),
     depend => { 'core.o' => 'core_or_not.inc',
 		'notcore.o' => 'core_or_not.inc' },
 );
