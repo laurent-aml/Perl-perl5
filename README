@@ -2,6 +2,73 @@ Perl is Copyright (C) 1993 - 2026 by Larry Wall and others.
 
 All rights reserved.
 
+# ABOUT THIS FORK
+
+This forlk mainly introduces public APIs for Green Threads and
+MultiCore support, but also includes bug fixes which may not have
+landed (yet?) upstream.
+
+## Threads in Perl
+
+Following the ordinary computer-science definition (as summarised on Wikipedia):
+a **thread of execution** is the smallest sequence of programmed instructions
+that can be managed independently by a scheduler. Multiple threads within a
+single process run *concurrently* and *fully share the process's memory* and
+resources (address space, file descriptors, globals), in contrast to separate
+processes, which do not share those resources. A thread is characterised by
+three things:
+
+1. an independent **flow of control** — its own instruction pointer and call
+   stack;
+2. **shared memory** with the other threads of the process; and
+3. **lightweight lifecycle management** — cheap to create, and cheap for a
+   scheduler to start, suspend, resume, switch between, and join.
+
+MultiCore parallelism is the ability to run **simultaneous execution on multiple
+CPU cores**.
+It is not part of the definition of a thread. A thread requires *concurrency*
+which is a *structuring* property. *Parallelism* is a *performance* property,
+and an additional capability layered on top.
+Parallelism is routinely implemented in Perl using processes.
+
+Perl supports two flavors of Pure-Perl threads, both green threads:
+* Coro, the stackful green threads,
+* Future::AwaitAsync, the stackless green threads.
+
+And two flavors of XS threads:
+* Coro::Multicore, allowing the Perl interpreter to run concurrently with XS code,
+* C-level threads within XS: OS threads internally implemented in XS (eg PDL),
+  but blocking the Perl interpreter while executing.
+
+A number of CPAN modules already support Multicore. More, or improved, versions
+are available in this fork repository as well. See also Coro::Multicore documentation
+for other sources of Multicore-enabled modules.
+
+Note that Perl "ithreads" are not threads per the definition given above.
+`perldoc threads` officially discourages its use for new code. It is, in effect,
+"processes that look like threads," with most of the cost of processes and little
+of the convenience of threads.
+
+## Why Thread APIs
+
+This fork provides public APIs to support Green Threads and MultiCore.
+Those APIs are used by the forked versions of Coro, Future::AwaitAsync and
+Coro::Multicore.
+
+The upstream versions of those modules already provide threads on top of the
+upstream Perl. What this fork brings is **stabitily**, as the upstream thread
+modules both suffer from relying on Perl internals which Perl5 Porters don't
+want (legitimately) to support as public APIs.
+In the past, Coro has been broken many times by Perl internal changes, which
+motivated this fork. The last dating from Perl 5.24, and still not fixed in
+Coro 6.57.
+
+See Porting/green_threads_and_execstate.md for all the details.
+
+----
+
+The remainding of this README is the original Perl5 one.
+
 # ABOUT PERL
 
 Perl is a general-purpose programming language originally developed for
